@@ -1,0 +1,4 @@
+interface:
+  display_name: "Cobertura Portal"
+  short_description: "Consulta y replica el portal MSP"
+  default_prompt: "Use $cobertura-portal to inspect, query, or replicate the MSP coverage portal workflow."

@@ -1,0 +1,12 @@
+node_modules/
+output/
+uploads/
+
+data/resultados.csv
+data/~$*.xlsx
+
+tmp_*.js
+tmp_*.html
+network_log.json
+
+*.log

@@ -1,0 +1,15 @@
+{
+  "scripts": {
+    "start": "node server/app.js"
+  },
+  "dependencies": {
+    "crypto-js": "^4.2.0",
+    "express": "^5.2.1",
+    "multer": "^2.1.0",
+    "pdf-lib": "^1.17.1",
+    "pdfjs-dist": "^5.5.207",
+    "pdfkit": "^0.17.2",
+    "playwright": "^1.58.2",
+    "xlsx": "^0.18.5"
+  }
+}

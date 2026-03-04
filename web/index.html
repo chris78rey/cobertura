@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Cobertura Salud</title>
+  <style>
+    :root {
+      --bg: #eef3ea;
+      --panel: rgba(255, 255, 255, 0.9);
+      --ink: #173222;
+      --muted: #557160;
+      --line: rgba(23, 50, 34, 0.12);
+      --accent: #1f7a4d;
+      --accent-strong: #125a38;
+      --soft: #f3f7f1;
+      --shadow: 0 24px 80px rgba(28, 58, 41, 0.12);
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: Georgia, "Times New Roman", serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, rgba(76, 140, 94, 0.18), transparent 34%),
+        linear-gradient(180deg, #f7fbf5 0%, var(--bg) 100%);
+      min-height: 100vh;
+    }
+    .shell {
+      width: min(1100px, calc(100% - 32px));
+      margin: 32px auto 48px;
+      display: grid;
+      gap: 24px;
+    }
+    .hero, .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(8px);
+    }
+    .hero {
+      padding: 32px;
+      position: relative;
+      overflow: hidden;
+    }
+    .hero::after {
+      content: "";
+      position: absolute;
+      width: 260px;
+      height: 260px;
+      right: -70px;
+      top: -70px;
+      border-radius: 50%;
+      background: radial-gradient(circle, rgba(31, 122, 77, 0.22), transparent 70%);
+    }
+    .eyebrow {
+      margin: 0 0 10px;
+      font-size: 12px;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+      color: var(--accent);
+    }
+    h1 {
+      margin: 0;
+      font-size: clamp(2rem, 6vw, 4rem);
+      line-height: 0.95;
+      max-width: 12ch;
+    }
+    .lead {
+      margin: 16px 0 0;
+      max-width: 60ch;
+      color: var(--muted);
+      line-height: 1.6;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 24px;
+    }
+    .panel { padding: 24px; }
+    h2 { margin-top: 0; font-size: 1.35rem; }
+    p { line-height: 1.5; }
+    .muted { color: var(--muted); }
+    .actions {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-top: 16px;
+    }
+    .button, button {
+      border: 0;
+      border-radius: 999px;
+      padding: 13px 18px;
+      font: inherit;
+      font-weight: 700;
+      cursor: pointer;
+      text-decoration: none;
+      color: white;
+      background: linear-gradient(135deg, var(--accent) 0%, var(--accent-strong) 100%);
+    }
+    .button.secondary {
+      background: white;
+      color: var(--ink);
+      border: 1px solid var(--line);
+    }
+    form {
+      display: grid;
+      gap: 16px;
+    }
+    input[type="file"] {
+      width: 100%;
+      padding: 14px 16px;
+      border-radius: 14px;
+      border: 1px solid var(--line);
+      background: white;
+      font: inherit;
+    }
+    .result {
+      white-space: pre-wrap;
+      background: var(--soft);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 16px;
+      min-height: 240px;
+      font-family: "Courier New", monospace;
+      font-size: 0.9rem;
+      overflow: auto;
+    }
+    .summary {
+      display: grid;
+      gap: 10px;
+      margin-top: 16px;
+    }
+    .summary a { color: var(--accent-strong); }
+    @media (max-width: 900px) {
+      .grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <section class="hero">
+      <p class="eyebrow">Windows + Node.js</p>
+      <h1>Carga Excel y genera PDFs</h1>
+      <p class="lead">
+        Sube un Excel con tres columnas: <code>nombre_pdf</code>, <code>cedula</code> y <code>fecha</code>.
+        La aplicación consultará el portal, guardará el JSON y generará un PDF por cada fila.
+      </p>
+      <div class="actions">
+        <a class="button secondary" href="/data/plantilla_carga_pdfs.xlsx">Descargar plantilla Excel</a>
+        <a class="button secondary" href="/data/plantilla_carga_pdfs.csv">Descargar plantilla CSV</a>
+      </div>
+    </section>
+
+    <section class="grid">
+      <article class="panel">
+        <h2>Subir Excel</h2>
+        <p class="muted">
+          La primera hoja debe tener estas columnas exactas: <code>nombre_pdf</code>, <code>cedula</code>, <code>fecha</code>.
+        </p>
+        <form id="upload-form">
+          <input id="excel-file" name="file" type="file" accept=".xlsx,.xls" required>
+          <button type="submit">Procesar archivo</button>
+        </form>
+        <div class="summary" id="summary"></div>
+      </article>
+
+      <article class="panel">
+        <h2>Resultado</h2>
+        <div id="result" class="result">Esperando archivo...</div>
+      </article>
+    </section>
+  </main>
+
+  <script>
+    const form = document.getElementById("upload-form");
+    const fileInput = document.getElementById("excel-file");
+    const result = document.getElementById("result");
+    const summary = document.getElementById("summary");
+
+    function toPublicPath(absPath) {
+      const marker = "\\output\\";
+      const idx = absPath.indexOf(marker);
+      return idx >= 0 ? "/output/" + absPath.slice(idx + marker.length).replace(/\\\\/g, "/") : "#";
+    }
+
+    function renderSummary(data) {
+      if (!data || !data.csv_report) {
+        summary.innerHTML = "";
+        return;
+      }
+      summary.innerHTML = `
+        <div><strong>Filas:</strong> ${data.total_rows}</div>
+        <div><strong>Exitosas:</strong> ${data.success_count}</div>
+        <div><strong>Fallidas:</strong> ${data.failure_count}</div>
+        <div><a href="${toPublicPath(data.json_report)}">Abrir reporte JSON</a></div>
+        <div><a href="${toPublicPath(data.csv_report)}">Abrir reporte CSV</a></div>
+      `;
+    }
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      if (!fileInput.files.length) {
+        result.textContent = "Selecciona un archivo Excel.";
+        return;
+      }
+
+      const formData = new FormData();
+      formData.append("file", fileInput.files[0]);
+      result.textContent = "Procesando archivo, consultando portal y generando PDFs...";
+      summary.innerHTML = "";
+
+      try {
+        const response = await fetch("/api/process-excel", {
+          method: "POST",
+          body: formData,
+        });
+        const data = await response.json();
+        if (!response.ok) {
+          throw new Error(data.error || "Fallo procesando el archivo.");
+        }
+        result.textContent = JSON.stringify(data, null, 2);
+        renderSummary(data);
+      } catch (error) {
+        result.textContent = error.message;
+      }
+    });
+  </script>
+</body>
+</html>
