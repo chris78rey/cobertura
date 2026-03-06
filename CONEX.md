@@ -1,215 +1,133 @@
-# Transacción y conexión Oracle (guía para replicar en otro proyecto)
+# Conexión Oracle en este repo (guía simple y alineada)
 
-Este documento resume cómo está implementada la conexión Oracle en este repo (`DIGITALIZACION`) para que puedas replicarla en otro aplicativo sin romper lo que ya funciona.
+Este repositorio está centrado en la integración MSP (`scripts/query_live.js`) y generación de PDF (`scripts/generate_pdf.js`).
 
-## 1) Stack usado en este proyecto
+La conexión Oracle es **complementaria** (por ejemplo, para cruzar datos locales), no parte del flujo oficial del portal MSP.
 
-- Python
-- `JayDeBeApi` + `JPype1`
-- Driver JDBC Oracle: `ojdbc8` (archivo local: `jdbc/ojdbc8 copy.jar`)
-- Conexión a RAC por lista de targets (`host:port:sid`) con failover manual
+## 1) Objetivo y límites
 
-Referencia en código:
-- `fastapi_app/app.py` (`_cd_oracle_connect`, `_cd_oracle_select`, `_cd_oracle_execute`)
-- `scripts/oracle_jdbc_smoketest.py` (smoke test)
-- `scripts/oracle_make_dirs_from_tree.py` (ejemplo robusto de transacción)
+- Mantener intacta la lógica MSP actual.
+- Usar Oracle como fuente adicional, separada del core de consulta MSP.
+- Evitar mezclar lógica Oracle dentro de `scripts/query_live.js`.
 
-## 2) Variables de entorno obligatorias
+## 2) Forma más sencilla recomendada
 
-Basado en `.env.example`:
+La opción más simple y estable para este repo es usar **Python + `oracledb` en modo thin** (sin Instant Client).
 
-- `ORACLE_USER` (ej. `DIGITALIZACION`)
+Ventajas:
+
+- No requiere `ojdbc` ni JVM.
+- Menos fricción en Linux/WSL.
+- Ideal para smoke tests y consultas puntuales.
+
+## 3) Variables de entorno
+
+Define estas variables (en tu entorno local o en un `.env` no versionado):
+
+- `ORACLE_USER`
 - `ORACLE_PASSWORD`
-- `ORACLE_JDBC_JAR` (default: `jdbc/ojdbc8 copy.jar`)
-- `ORACLE_TARGETS` (ej. `172.16.60.20:1521:prdsgh1,172.16.60.21:1521:prdsgh2`)
+- `ORACLE_HOST`
+- `ORACLE_PORT` (ejemplo: `1521`)
+- `ORACLE_SERVICE` (service name)
 
-Opcionales según módulo:
-- `ORACLE_SOURCE_TABLE`
-- `ORACLE_TREE_TABLE`
-- `ORACLE_OWNER` / `ORACLE_CONTROL_DOC_OWNER`
+DSN resultante:
 
-## 3) Manejo de claves (passwords) recomendado
-
-Cómo se hace aquí:
-
-1. Se carga `.env` al inicio del proceso (helper `_load_dotenv(Path('.env'))`).
-2. No se comitea `.env`.
-3. Si falta `ORACLE_PASSWORD`, algunos scripts abortan o piden prompt (solo local).
-4. Se evita imprimir password en logs.
-
-Buenas prácticas para el otro proyecto:
-
-- Producción: inyectar credenciales por variables de entorno del servicio (systemd/k8s/secret manager).
-- Desarrollo: `.env` local no versionado.
-- Nunca loguear DSN completo con credenciales.
-
-## 4) Timezone/JDBC para evitar ORA-01882
-
-En este host se fuerza:
-
-```bash
-JAVA_TOOL_OPTIONS='-Doracle.jdbc.timezoneAsRegion=false -Duser.timezone=UTC'
+```text
+HOST:PORT/SERVICE
 ```
-
-Se usa en servicios y loops. Esto evita errores de región horaria en Oracle JDBC.
-
-## 5) Patrón de conexión usado (failover RAC)
-
-La conexión no usa un único host fijo. Se intenta por orden cada target hasta conectar:
-
-1. Parsear `ORACLE_TARGETS` (lista `host:port:sid`)
-2. Construir URL: `jdbc:oracle:thin:@host:port:sid`
-3. `jaydebeapi.connect(...)`
-4. Si falla, pasar al siguiente target
-5. Si todos fallan, error final
-
-## 6) Patrón de consultas (SELECT)
-
-Patrón aplicado:
-
-- Abrir conexión
-- Abrir cursor
-- Ejecutar SQL con parámetros bind (nunca concatenar valores de usuario)
-- `fetchall()` o `fetchmany()`
-- Cerrar cursor y conexión en `finally`
-
-Ejemplo base (estilo repo):
-
-```python
-import jaydebeapi
-from pathlib import Path
-
-
-def oracle_select(sql: str, params: tuple[object, ...] = ()):
-    conn = oracle_connect_failover()
-    try:
-        cur = conn.cursor()
-        try:
-            cur.execute(sql, params)
-            return cur.fetchall()
-        finally:
-            cur.close()
-    finally:
-        conn.close()
-```
-
-## 7) Patrón de inserciones/updates (DML)
-
-En `fastapi_app/app.py` se usa helper tipo `execute`:
-
-- `cur.execute(sql, params)`
-- `conn.commit()`
-- devolver `rowcount`
 
 Ejemplo:
 
-```python
-def oracle_execute(sql: str, params: tuple[object, ...] = ()) -> int:
-    conn = oracle_connect_failover()
-    try:
-        cur = conn.cursor()
-        try:
-            cur.execute(sql, params)
-            rc = int(cur.rowcount) if cur.rowcount is not None else 0
-            conn.commit()
-            return rc
-        finally:
-            cur.close()
-    finally:
-        conn.close()
+```text
+172.16.60.20:1521/ORCLPDB1
 ```
 
-## 8) Transacciones reales (batch) y autocommit
+## 4) Smoke test mínimo
 
-En `scripts/oracle_make_dirs_from_tree.py` se muestra un patrón más fino:
+Instala dependencia:
 
-- Detectar/autocontrolar autocommit con `conn.jconn.getAutoCommit()`
-- Si aplica, desactivar autocommit: `setAutoCommit(False)`
-- Ejecutar múltiples `UPDATE`
-- `commit` cada N filas (`--commit-every`)
-- `commit` final
+```bash
+python3 -m pip install oracledb
+```
 
-Esto es clave para procesos masivos y para no hacer commit por cada fila cuando no conviene.
+Prueba conexión con `SELECT 1 FROM dual`:
 
-## 9) Reglas SQL importantes para replicar
-
-- Usar bind variables (`?`) en parámetros de valor
-- No usar `SELECT *` en producción (seleccionar columnas necesarias)
-- Para objetos dinámicos (schema/tabla), validar/canonizar identificadores antes de interpolar
-- Cerrar siempre cursor/connection
-- Capturar excepción por target para failover
-
-## 10) Errores frecuentes y diagnóstico rápido
-
-1. `Jar not found`
-- Revisar `ORACLE_JDBC_JAR` y archivo físico.
-
-2. `ORACLE_USER or ORACLE_PASSWORD not set`
-- Revisar `.env`/variables del servicio.
-
-3. `Failed to connect to any target`
-- Revisar red/VPN/firewall/targets.
-
-4. `ORA-01882`
-- Revisar `JAVA_TOOL_OPTIONS` con timezone flags.
-
-5. Prompt interactivo falla en servicio
-- No depender de prompt; usar variables de entorno.
-
-## 11) Checklist para el otro proyecto
-
-1. Instalar dependencias: `JayDeBeApi`, `JPype1`.
-2. Tener `ojdbc8.jar` local y ruta configurable.
-3. Implementar `_load_dotenv` (solo local/dev).
-4. Implementar parseo de `ORACLE_TARGETS` y failover.
-5. Crear helpers separados:
-- `oracle_connect_failover()`
-- `oracle_select(sql, params)`
-- `oracle_execute(sql, params)`
-6. Definir política de commit para batch (`commit every N`).
-7. Forzar `JAVA_TOOL_OPTIONS` en runtime productivo.
-8. Agregar smoke test tipo `SELECT 1 FROM dual` al arranque o healthcheck.
-
-## 12) Ejemplo mínimo reutilizable (copiable)
-
-```python
+```bash
+python3 - <<'PY'
 import os
-from pathlib import Path
-import jaydebeapi
+import oracledb
 
+user = os.environ["ORACLE_USER"]
+password = os.environ["ORACLE_PASSWORD"]
+host = os.environ["ORACLE_HOST"]
+port = os.environ.get("ORACLE_PORT", "1521")
+service = os.environ["ORACLE_SERVICE"]
+dsn = f"{host}:{port}/{service}"
 
-def parse_targets(raw: str):
-    out = []
-    for item in (raw or "").split(","):
-        item = item.strip()
-        if not item:
-            continue
-        host, port_s, sid = item.split(":", 2)
-        out.append((host, int(port_s), sid))
-    return out
-
-
-def oracle_connect_failover():
-    jar = Path(os.environ.get("ORACLE_JDBC_JAR", "jdbc/ojdbc8 copy.jar")).expanduser()
-    user = os.environ.get("ORACLE_USER", "").strip()
-    password = os.environ.get("ORACLE_PASSWORD", "").strip()
-    if not jar.exists():
-        raise RuntimeError(f"Jar not found: {jar}")
-    if not user or not password:
-        raise RuntimeError("ORACLE_USER or ORACLE_PASSWORD not set")
-
-    targets = parse_targets(os.environ.get("ORACLE_TARGETS", "172.16.60.20:1521:prdsgh1,172.16.60.21:1521:prdsgh2"))
-    last_exc = None
-    for host, port, sid in targets:
-        url = f"jdbc:oracle:thin:@{host}:{port}:{sid}"
-        try:
-            return jaydebeapi.connect("oracle.jdbc.OracleDriver", url, [user, password], jars=[str(jar)])
-        except Exception as e:
-            last_exc = e
-            continue
-    raise RuntimeError("Failed to connect to Oracle targets") from last_exc
+with oracledb.connect(user=user, password=password, dsn=dsn) as conn:
+    with conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM dual")
+        print(cur.fetchone()[0])
+PY
 ```
+
+Si imprime `1`, la conexión base está correcta.
+
+## 5) Patrón recomendado en este proyecto
+
+- Oracle en script separado (por ejemplo `scripts/oracle_smoketest.py` o `scripts/oracle_query.py`).
+- Consultar Oracle primero o después según necesidad, pero conservar el pipeline MSP:
+  1. consultar MSP,
+  2. persistir JSON,
+  3. generar PDF desde JSON.
+- No tratar un fallo Oracle como “sin cobertura MSP”; reportarlo como fallo de integración auxiliar.
+
+## 6) Formato de fecha para MSP
+
+- `scripts/query_live.js` recibe `--fecha` en formato `YYYY-MM-DD`.
+- Internamente convierte a `DD-MM-YYYY` antes del cifrado AES para el portal MSP.
+- Si la fecha viene de Oracle (`DATE`), conviértela explícitamente con `strftime("%Y-%m-%d")` antes de llamar `query_live`.
+
+## 7) Reescaneo Oracle con marca `N -> S`
+
+Se agregó `scripts/oracle_rescan_cobertura.py` para este flujo:
+
+1. leer filas de `DIGITALIZACION.DIGITALIZACION` con `DIG_COBERTURA='N'`;
+2. tomar `DIG_CEDULA` y `DIG_FECHA_PLANILLA`;
+3. ejecutar consulta MSP reutilizando `scripts/query_live.js`;
+4. guardar JSON local en `output/oracle_sync/`;
+5. actualizar `DIG_COBERTURA='S'` y `DIG_FECHA_PROCESO=SYSDATE` cuando la cobertura se genera.
+
+Ejecución sugerida:
+
+```bash
+python3 scripts/oracle_rescan_cobertura.py --dotenv .env.example --thick --limit 60
+```
+
+Primera prueba sin actualizar Oracle:
+
+```bash
+python3 scripts/oracle_rescan_cobertura.py --dotenv .env.example --thick --limit 1 --dry-run
+```
+
+## 8) Errores comunes
+
+1. `KeyError: ORACLE_*`
+- Falta variable de entorno.
+
+2. `DPY-6005` / timeout / connection refused
+- Red, VPN, firewall o host/puerto incorrecto.
+
+3. `ORA-01017`
+- Usuario/clave inválidos.
+
+4. `ORA-12514`
+- `SERVICE_NAME` incorrecto.
+
+## 9) Nota sobre JDBC en este repo
+
+Existe `jdbc/ojdbc8.jar` en el árbol, pero **no es la ruta recomendada** para la integración simple de este proyecto. Úsalo solo si necesitas compatibilidad específica con una solución Java/JDBC heredada.
 
 ---
 
-Si quieres, en el siguiente paso te preparo un módulo `oracle_client.py` ya listo para copiar/pegar en el otro repo con tests de conexión y helpers de transacción.
+Si quieres, en el siguiente paso te creo `scripts/oracle_smoketest.py` listo para ejecutar con estas variables. 

@@ -2,6 +2,7 @@ const fs = require("fs");
 const path = require("path");
 const { runSingle } = require("./query_live");
 const { generatePdfFromResult } = require("./generate_pdf");
+const { formatDateTimeInTimezone, formatTimestampSlugInTimezone } = require("./runtime_config");
 
 function parseArgs(argv) {
   const args = {};
@@ -512,7 +513,7 @@ async function main() {
         cedula: job.cedula,
         fecha_inicio: job.fecha_inicio,
         fecha_fin: job.fecha_fin,
-        generated_at: new Date().toISOString(),
+        generated_at: formatDateTimeInTimezone(new Date()),
         processed_units: processedUnits,
         total_units: totalUnits,
         results,
@@ -540,7 +541,7 @@ async function main() {
     }
   }
 
-  const reportStamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const reportStamp = formatTimestampSlugInTimezone(new Date());
   const consolidatedJson = path.join(reportDir, `batch_report_${reportStamp}.json`);
   const consolidatedCsv = path.join(reportDir, `batch_report_${reportStamp}.csv`);
   const csvRows = allResults.map((item) => ({
@@ -563,7 +564,7 @@ async function main() {
   }));
 
   writeJson(consolidatedJson, {
-    generated_at: new Date().toISOString(),
+    generated_at: formatDateTimeInTimezone(new Date()),
     total_jobs: jobs.length,
     total_results: allResults.length,
     success_count: allResults.filter((item) => item.status === "success").length,

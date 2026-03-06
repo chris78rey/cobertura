@@ -3,6 +3,7 @@ const path = require("path");
 const XLSX = require("xlsx");
 const { runSingle } = require("./query_live");
 const { generatePdfFromResult } = require("./generate_pdf");
+const { formatDateTimeInTimezone, formatTimestampSlugInTimezone } = require("./runtime_config");
 
 function ensureDir(dirPath) {
   fs.mkdirSync(dirPath, { recursive: true });
@@ -152,14 +153,14 @@ async function processExcelFile(filePath, options = {}) {
     }
   }
 
-  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const stamp = formatTimestampSlugInTimezone(new Date());
   const jsonReport = path.join(reportsDir, `excel_batch_${stamp}.json`);
   const csvReport = path.join(reportsDir, `excel_batch_${stamp}.csv`);
   fs.writeFileSync(
     jsonReport,
     JSON.stringify(
       {
-        generated_at: new Date().toISOString(),
+        generated_at: formatDateTimeInTimezone(new Date()),
         source_file: path.resolve(filePath),
         total_rows: results.length,
         success_count: results.filter((item) => item.status === "success").length,

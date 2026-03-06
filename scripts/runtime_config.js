@@ -4,6 +4,7 @@ const https = require("https");
 
 let envLoaded = false;
 let cachedAgent = null;
+const DEFAULT_TIMEZONE = "America/Guayaquil";
 
 function parseEnvLine(line) {
   const trimmed = line.trim();
@@ -74,7 +75,57 @@ function getHttpsAgent() {
   return cachedAgent;
 }
 
+function getConfiguredTimezone() {
+  loadEnvFile();
+  const value = String(process.env.COBERTURA_TIMEZONE || "").trim();
+  return value || DEFAULT_TIMEZONE;
+}
+
+function getDateTimeParts(date, timeZone) {
+  const formatter = new Intl.DateTimeFormat("en-GB", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
+  const parts = formatter.formatToParts(date);
+  const map = Object.fromEntries(parts.map((item) => [item.type, item.value]));
+  return {
+    year: map.year,
+    month: map.month,
+    day: map.day,
+    hour: map.hour,
+    minute: map.minute,
+    second: map.second,
+  };
+}
+
+function formatDateTimeInTimezone(date = new Date(), options = {}) {
+  const timeZone = options.timeZone || getConfiguredTimezone();
+  const includeSeconds = options.includeSeconds !== false;
+  const parts = getDateTimeParts(date, timeZone);
+  const hhmm = `${parts.hour}:${parts.minute}`;
+  const timePart = includeSeconds ? `${hhmm}:${parts.second}` : hhmm;
+  return `${parts.year}-${parts.month}-${parts.day} ${timePart}`;
+}
+
+function formatTimestampSlugInTimezone(date = new Date(), options = {}) {
+  return formatDateTimeInTimezone(date, {
+    timeZone: options.timeZone,
+    includeSeconds: true,
+  })
+    .replace(" ", "T")
+    .replace(/:/g, "-");
+}
+
 module.exports = {
   loadEnvFile,
   getHttpsAgent,
+  getConfiguredTimezone,
+  formatDateTimeInTimezone,
+  formatTimestampSlugInTimezone,
 };

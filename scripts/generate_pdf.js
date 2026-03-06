@@ -3,6 +3,7 @@ const path = require("path");
 const PDFDocument = require("pdfkit");
 const SVGtoPDF = require("svg-to-pdfkit");
 const { runSingle } = require("./query_live");
+const { formatDateTimeInTimezone } = require("./runtime_config");
 const { loadSvgLayout } = require("./svg_layout");
 
 const PAGE_WIDTH = 841.89;
@@ -177,27 +178,105 @@ function svgTable({ x, y, widths, headers, rows, headerHeight, rowHeight, header
   return elements.join("\n");
 }
 
-function generateSvgFromResult({ result, cedula, fecha, outputName = "", outputDir = "output" }) {
-  const data = result.response.data;
-  const seguros =
-    data && data.coberturaSalud && data.coberturaSalud.CoberturaSeguros
-      ? data.coberturaSalud.CoberturaSeguros.aseguradora || []
-      : [];
-  const privados = parsePrivados(data);
+function estimateRowHeight(row, widths, fontSize, minHeight, options = {}) {
+  const lineHeight = options.lineHeight || 1.2;
+  const cellPaddingY = options.cellPaddingY || 5;
+  let maxLines = 1;
+  for (let index = 0; index < widths.length; index += 1) {
+    const cell = row[index] || "-";
+    const lines = wrapText(cell, Math.max(20, widths[index] - 10), fontSize);
+    maxLines = Math.max(maxLines, lines.length);
+  }
+  const dynamicHeight = maxLines * fontSize * lineHeight + cellPaddingY * 2;
+  return Math.max(minHeight, Math.ceil(dynamicHeight));
+}
 
-  const outDir = path.resolve(outputDir);
-  ensureDir(outDir);
-  const baseName = resolveBaseName(cedula, fecha, outputName);
-  const svgPath = path.join(outDir, `${baseName}.svg`);
-  const layout = loadSvgLayout();
+function svgTableDynamic({
+  x,
+  y,
+  widths,
+  headers,
+  rows,
+  rowHeights,
+  headerHeight,
+  headerFontSize,
+  bodyFontSize,
+  lineWidth,
+}) {
+  const elements = [];
+  let cursorX = x;
+  for (let index = 0; index < headers.length; index += 1) {
+    const width = widths[index];
+    elements.push(`<rect x="${cursorX}" y="${y}" width="${width}" height="${headerHeight}" fill="none" stroke="#000" stroke-width="${lineWidth}"/>`);
+    elements.push(
+      svgText({
+        text: headers[index],
+        x: cursorX + width / 2,
+        y: y + headerFontSize + 5,
+        size: headerFontSize,
+        bold: true,
+        anchor: "middle",
+        width: width - 12,
+      })
+    );
+    cursorX += width;
+  }
 
-  const nombre = seguros.find((item) => item.Nombre)?.Nombre || "";
+  let rowY = y + headerHeight;
+  for (let rowIndex = 0; rowIndex < rows.length; rowIndex += 1) {
+    const row = rows[rowIndex];
+    const rowHeight = rowHeights[rowIndex];
+    cursorX = x;
+    for (let colIndex = 0; colIndex < widths.length; colIndex += 1) {
+      const width = widths[colIndex];
+      elements.push(
+        `<rect x="${cursorX}" y="${rowY}" width="${width}" height="${rowHeight}" fill="none" stroke="#000" stroke-width="${lineWidth}"/>`
+      );
+      elements.push(
+        svgText({
+          text: row[colIndex] || "-",
+          x: cursorX + 5,
+          y: rowY + bodyFontSize + 5,
+          size: bodyFontSize,
+          width: width - 10,
+        })
+      );
+      cursorX += width;
+    }
+    rowY += rowHeight;
+  }
+  return elements.join("\n");
+}
 
-  const mspHref = svgAssetHref(outDir, "logomsp.jpg");
-  const rpisHref = svgAssetHref(outDir, "logorpis.jpg");
-  const escudoHref =
-    svgAssetHref(outDir, "escudo_ec.png") || svgAssetHref(outDir, "escudo_ec.jpg") || svgAssetHref(outDir, "escudo_ec.jpeg");
+function paginateRows(rows, rowHeights, maxContentHeight, headerHeight) {
+  const pages = [];
+  let cursor = 0;
+  while (cursor < rows.length) {
+    let used = headerHeight;
+    const pageRows = [];
+    const pageHeights = [];
+    while (cursor < rows.length) {
+      const nextHeight = rowHeights[cursor];
+      if (pageRows.length > 0 && used + nextHeight > maxContentHeight) {
+        break;
+      }
+      pageRows.push(rows[cursor]);
+      pageHeights.push(nextHeight);
+      used += nextHeight;
+      cursor += 1;
+      if (pageRows.length === 1 && used > maxContentHeight) {
+        break;
+      }
+    }
+    pages.push({ rows: pageRows, rowHeights: pageHeights });
+  }
+  if (!pages.length) {
+    pages.push({ rows: [], rowHeights: [] });
+  }
+  return pages;
+}
 
+function buildFooterImages(outDir) {
   const footerLogos = ["logomsp.jpg", "mininterior.jpg", "mindefensa.jpg", "iess.jpg", "issfa.jpg", "isspol.jpg"];
   const footerSizes = [
     [76, 22],
@@ -220,6 +299,66 @@ function generateSvgFromResult({ result, cedula, fecha, outputName = "", outputD
     }
     footerX += width + 16;
   }
+  return footerImages;
+}
+
+function buildSvgPage({
+  body,
+  pageNumber,
+  totalPages,
+  layout,
+  outDir,
+}) {
+  const mspHref = svgAssetHref(outDir, "logomsp.jpg");
+  const rpisHref = svgAssetHref(outDir, "logorpis.jpg");
+  const escudoHref =
+    svgAssetHref(outDir, "escudo_ec.png") || svgAssetHref(outDir, "escudo_ec.jpg") || svgAssetHref(outDir, "escudo_ec.jpeg");
+  const footerImages = buildFooterImages(outDir);
+
+  const escudoScale = 0.84;
+  const escudoWidth = layout.escudo.width * escudoScale;
+  const escudoHeight = layout.escudo.height * escudoScale;
+  const escudoX = layout.escudo.x + (layout.escudo.width - escudoWidth) / 2;
+  const escudoY = layout.escudo.y + (layout.escudo.height - escudoHeight) / 2;
+
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="${PAGE_WIDTH}" height="${PAGE_HEIGHT}" viewBox="0 0 ${PAGE_WIDTH} ${PAGE_HEIGHT}">
+  <line x1="20" y1="${layout.headerLineY}" x2="${PAGE_WIDTH - 20}" y2="${layout.headerLineY}" stroke="#000" stroke-width="1.1"/>
+  ${mspHref ? `<image href="${escapeXml(mspHref)}" x="${layout.mspLogo.x}" y="${layout.mspLogo.y}" width="${layout.mspLogo.width}" height="${layout.mspLogo.height}"/>` : ""}
+  ${rpisHref ? `<image href="${escapeXml(rpisHref)}" x="${layout.rpisLogo.x}" y="${layout.rpisLogo.y}" width="${layout.rpisLogo.width}" height="${layout.rpisLogo.height}"/>` : ""}
+  ${escudoHref ? `<image href="${escapeXml(escudoHref)}" x="${escudoX}" y="${escudoY}" width="${escudoWidth}" height="${escudoHeight}" opacity="0.62"/>` : `<rect x="${layout.escudo.x}" y="${layout.escudo.y}" width="${layout.escudo.width}" height="${layout.escudo.height}" fill="none" stroke="#000" stroke-width="1"/>${svgText({ text: "EC", x: layout.escudo.x + layout.escudo.width / 2, y: layout.escudo.y + layout.escudo.height / 2 + 5, size: 13, bold: true, anchor: "middle" })}`}
+
+  ${body}
+
+  <line x1="20" y1="${PAGE_HEIGHT - 108}" x2="${PAGE_WIDTH - 20}" y2="${PAGE_HEIGHT - 108}" stroke="#000" stroke-width="1.1"/>
+  ${footerImages.join("\n")}
+  <line x1="20" y1="${PAGE_HEIGHT - 76}" x2="${PAGE_WIDTH - 20}" y2="${PAGE_HEIGHT - 76}" stroke="#000" stroke-width="1.1"/>
+  ${svgText({ text: `${pageNumber} / ${totalPages}`, x: PAGE_WIDTH / 2, y: PAGE_HEIGHT - 61, size: 7.2, anchor: "middle" })}
+  ${svgText({ text: "Plataforma Gubernamental de Desarrollo Social", x: PAGE_WIDTH - 34, y: PAGE_HEIGHT - 69, size: 6.8, anchor: "end" })}
+  ${svgText({ text: "Av. Quitumbe Nan y Amaru Nan", x: PAGE_WIDTH - 34, y: PAGE_HEIGHT - 57, size: 6.8, anchor: "end" })}
+  ${svgText({ text: "Telf: 593 (2) 3814400  |  www.msp.gob.ec", x: PAGE_WIDTH - 34, y: PAGE_HEIGHT - 45, size: 6.8, anchor: "end" })}
+</svg>`;
+}
+
+function generateSvgFromResult({ result, cedula, fecha, outputName = "", outputDir = "output" }) {
+  const data = result.response.data;
+  const seguros =
+    data && data.coberturaSalud && data.coberturaSalud.CoberturaSeguros
+      ? data.coberturaSalud.CoberturaSeguros.aseguradora || []
+      : [];
+  const privados = parsePrivados(data);
+
+  const outDir = path.resolve(outputDir);
+  ensureDir(outDir);
+  const baseName = resolveBaseName(cedula, fecha, outputName);
+  const layout = loadSvgLayout();
+
+  const nombre = seguros.find((item) => item.Nombre)?.Nombre || "";
+
+  const mspHref = svgAssetHref(outDir, "logomsp.jpg");
+  const rpisHref = svgAssetHref(outDir, "logorpis.jpg");
+  const escudoHref =
+    svgAssetHref(outDir, "escudo_ec.png") || svgAssetHref(outDir, "escudo_ec.jpg") || svgAssetHref(outDir, "escudo_ec.jpeg");
 
   const privateRows = privados.length
     ? privados.map((item) => [
@@ -231,19 +370,45 @@ function generateSvgFromResult({ result, cedula, fecha, outputName = "", outputD
       ])
     : [["NO EXISTEN RESULTADOS PARA LOS PARAMETROS INGRESADOS", "", "", "", ""]];
 
-  const escudoScale = 0.84;
-  const escudoWidth = layout.escudo.width * escudoScale;
-  const escudoHeight = layout.escudo.height * escudoScale;
-  const escudoX = layout.escudo.x + (layout.escudo.width - escudoWidth) / 2;
-  const escudoY = layout.escudo.y + (layout.escudo.height - escudoHeight) / 2;
+  const segurosRows = (seguros.length ? seguros : [{
+    NombreInstitucion: "-",
+    TipoSeguro: "Servicio no disponible",
+    MensajeServicioExterno: "Servicio no disponible",
+    EstadoCobertura: "Servicio no disponible",
+  }]).map((item) => [
+    item.NombreInstitucion || "",
+    item.TipoSeguro || "Servicio no disponible",
+    item.MensajeServicioExterno || "Servicio no disponible",
+    item.EstadoCobertura || "Servicio no disponible",
+  ]);
 
-  const svg = `<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="${PAGE_WIDTH}" height="${PAGE_HEIGHT}" viewBox="0 0 ${PAGE_WIDTH} ${PAGE_HEIGHT}">
-  <line x1="20" y1="${layout.headerLineY}" x2="${PAGE_WIDTH - 20}" y2="${layout.headerLineY}" stroke="#000" stroke-width="1.1"/>
-  ${mspHref ? `<image href="${escapeXml(mspHref)}" x="${layout.mspLogo.x}" y="${layout.mspLogo.y}" width="${layout.mspLogo.width}" height="${layout.mspLogo.height}"/>` : ""}
-  ${rpisHref ? `<image href="${escapeXml(rpisHref)}" x="${layout.rpisLogo.x}" y="${layout.rpisLogo.y}" width="${layout.rpisLogo.width}" height="${layout.rpisLogo.height}"/>` : ""}
-  ${escudoHref ? `<image href="${escapeXml(escudoHref)}" x="${escudoX}" y="${escudoY}" width="${escudoWidth}" height="${escudoHeight}" opacity="0.62"/>` : `<rect x="${layout.escudo.x}" y="${layout.escudo.y}" width="${layout.escudo.width}" height="${layout.escudo.height}" fill="none" stroke="#000" stroke-width="1"/>${svgText({ text: "EC", x: layout.escudo.x + layout.escudo.width / 2, y: layout.escudo.y + layout.escudo.height / 2 + 5, size: 13, bold: true, anchor: "middle" })}`}
+  const segurosWidths = [92, 188, 255, 195];
+  const segurosHeaderHeight = 26;
+  const segurosBodyFont = 7.1;
+  const segurosLineWidth = 0.55;
+  const segurosRowHeights = segurosRows.map((row) => estimateRowHeight(row, segurosWidths, segurosBodyFont, 31));
 
+  const privadosWidths = [104, 248, 150, 105, 108];
+  const privadosHeaderHeight = 20;
+  const privadosBodyFont = 6.9;
+  const privadosLineWidth = 0.55;
+  const privadosRowHeights = privateRows.map((row) => estimateRowHeight(row, privadosWidths, privadosBodyFont, 19));
+
+  const mainTableTop = 202;
+  const mainTableBottom =
+    mainTableTop + segurosHeaderHeight + segurosRowHeights.reduce((sum, value) => sum + value, 0);
+  const noteY = mainTableBottom + 16;
+  const privateTitleY = noteY + 18;
+  const privateTableY = privateTitleY + 14;
+  const fechaConsultaY = PAGE_HEIGHT - 141;
+  const privateBottomLimit = fechaConsultaY - 8;
+  const privateAvailableHeight = Math.max(40, privateBottomLimit - privateTableY);
+
+  const privatePages = paginateRows(privateRows, privadosRowHeights, privateAvailableHeight, privadosHeaderHeight);
+
+  const pageBodies = [];
+  const firstPrivatePage = privatePages.shift() || { rows: [], rowHeights: [] };
+  pageBodies.push(`
   ${svgText({ text: "RED PUBLICA INTEGRAL DE SALUD", x: PAGE_WIDTH / 2, y: 100, size: 13.5, bold: true, anchor: "middle" })}
   ${svgText({ text: "CONSULTA DE COBERTURA DE SALUD", x: PAGE_WIDTH / 2, y: 128, size: 10.5, bold: true, anchor: "middle" })}
   ${svgText({ text: nombre, x: 50, y: 152, size: 7.8, bold: true })}
@@ -253,54 +418,75 @@ function generateSvgFromResult({ result, cedula, fecha, outputName = "", outputD
   ${svgText({ text: formatCoverageDate(fecha), x: PAGE_WIDTH - 50, y: 174, size: 8.2, anchor: "end" })}
   ${svgText({ text: "IESS, ISSFA, ISSPOL", x: PAGE_WIDTH / 2, y: 194, size: 8.3, bold: true, anchor: "middle" })}
 
-  ${svgTable({
+  ${svgTableDynamic({
     x: 50,
-    y: 202,
-    widths: [92, 188, 255, 195],
+    y: mainTableTop,
+    widths: segurosWidths,
     headers: ["Seguro", "Tipo de seguro", "Mensaje", "Registro de Cobertura\nde Atencion de Salud"],
-    rows: seguros.map((item) => [
-      item.NombreInstitucion || "",
-      item.TipoSeguro || "Servicio no disponible",
-      item.MensajeServicioExterno || "Servicio no disponible",
-      item.EstadoCobertura || "Servicio no disponible",
-    ]),
-    headerHeight: 26,
-    rowHeight: 31,
+    rows: segurosRows,
+    rowHeights: segurosRowHeights,
+    headerHeight: segurosHeaderHeight,
     headerFontSize: 7.6,
-    bodyFontSize: 7.1,
-    lineWidth: 0.55,
+    bodyFontSize: segurosBodyFont,
+    lineWidth: segurosLineWidth,
   })}
 
-  ${svgText({ text: "* La informacion historica reflejada corresponde a datos\ndesde Junio 2010", x: 70, y: 350, size: 6.2, fill: "#0000ff" })}
-  ${svgText({ text: "RED PRIVADA COMPLEMENTARIA", x: 70, y: 368, size: 8, bold: true })}
-
-  ${svgTable({
+  ${svgText({ text: "* La informacion historica reflejada corresponde a datos\ndesde Junio 2010", x: 70, y: noteY, size: 6.2, fill: "#0000ff" })}
+  ${svgText({ text: "RED PRIVADA COMPLEMENTARIA", x: 70, y: privateTitleY, size: 8, bold: true })}
+  ${svgTableDynamic({
     x: 50,
-    y: 382,
-    widths: [104, 248, 150, 105, 108],
+    y: privateTableY,
+    widths: privadosWidths,
     headers: ["RUC", "Nombre del Financiador", "Identificacion del\nBeneficiario", "Nombres", "Apellidos"],
-    rows: privateRows,
-    headerHeight: 20,
-    rowHeight: 19,
+    rows: firstPrivatePage.rows,
+    rowHeights: firstPrivatePage.rowHeights,
+    headerHeight: privadosHeaderHeight,
     headerFontSize: 7.2,
-    bodyFontSize: 6.9,
-    lineWidth: 0.55,
+    bodyFontSize: privadosBodyFont,
+    lineWidth: privadosLineWidth,
   })}
+  ${svgText({ text: "Fecha de consulta:", x: 488, y: fechaConsultaY, size: 8.3, bold: true })}
+  ${svgText({ text: formatDateTimeInTimezone(new Date(), { includeSeconds: false }), x: 690, y: fechaConsultaY, size: 8.3, anchor: "end" })}
+  `);
 
-  ${svgText({ text: "Fecha de consulta:", x: 488, y: 444, size: 8.3, bold: true })}
-  ${svgText({ text: new Date().toISOString().slice(0, 16).replace("T", " "), x: 690, y: 444, size: 8.3, anchor: "end" })}
+  for (const privatePage of privatePages) {
+    pageBodies.push(`
+    ${svgText({ text: "RED PRIVADA COMPLEMENTARIA (continuacion)", x: PAGE_WIDTH / 2, y: 120, size: 10, bold: true, anchor: "middle" })}
+    ${svgTableDynamic({
+      x: 50,
+      y: 142,
+      widths: privadosWidths,
+      headers: ["RUC", "Nombre del Financiador", "Identificacion del\nBeneficiario", "Nombres", "Apellidos"],
+      rows: privatePage.rows,
+      rowHeights: privatePage.rowHeights,
+      headerHeight: privadosHeaderHeight,
+      headerFontSize: 7.2,
+      bodyFontSize: privadosBodyFont,
+      lineWidth: privadosLineWidth,
+    })}
+    ${svgText({ text: "Fecha de consulta:", x: 488, y: fechaConsultaY, size: 8.3, bold: true })}
+    ${svgText({ text: formatDateTimeInTimezone(new Date(), { includeSeconds: false }), x: 690, y: fechaConsultaY, size: 8.3, anchor: "end" })}
+    `);
+  }
 
-  <line x1="20" y1="${PAGE_HEIGHT - 108}" x2="${PAGE_WIDTH - 20}" y2="${PAGE_HEIGHT - 108}" stroke="#000" stroke-width="1.1"/>
-  ${footerImages.join("\n")}
-  <line x1="20" y1="${PAGE_HEIGHT - 76}" x2="${PAGE_WIDTH - 20}" y2="${PAGE_HEIGHT - 76}" stroke="#000" stroke-width="1.1"/>
-  ${svgText({ text: "1 / 1", x: PAGE_WIDTH / 2, y: PAGE_HEIGHT - 61, size: 7.2, anchor: "middle" })}
-  ${svgText({ text: "Plataforma Gubernamental de Desarrollo Social", x: PAGE_WIDTH - 34, y: PAGE_HEIGHT - 69, size: 6.8, anchor: "end" })}
-  ${svgText({ text: "Av. Quitumbe Nan y Amaru Nan", x: PAGE_WIDTH - 34, y: PAGE_HEIGHT - 57, size: 6.8, anchor: "end" })}
-  ${svgText({ text: "Telf: 593 (2) 3814400  |  www.msp.gob.ec", x: PAGE_WIDTH - 34, y: PAGE_HEIGHT - 45, size: 6.8, anchor: "end" })}
-</svg>`;
+  const totalPages = pageBodies.length;
+  const svgPaths = [];
+  for (let index = 0; index < pageBodies.length; index += 1) {
+    const pageNumber = index + 1;
+    const pageSuffix = totalPages > 1 ? `_p${pageNumber}` : "";
+    const svgPath = path.join(outDir, `${baseName}${pageSuffix}.svg`);
+    const svgContent = buildSvgPage({
+      body: pageBodies[index],
+      pageNumber,
+      totalPages,
+      layout,
+      outDir,
+    });
+    fs.writeFileSync(svgPath, svgContent, "utf8");
+    svgPaths.push(svgPath);
+  }
 
-  fs.writeFileSync(svgPath, svg, "utf8");
-  return { svgPath };
+  return { svgPath: svgPaths[0], svgPaths };
 }
 
 function writeLabelValue(doc, label, value, options = {}) {
@@ -491,7 +677,8 @@ function applyChromeToAllPages(doc) {
   }
 }
 
-async function renderPdfFromSvg({ svgPath, pdfPath }) {
+async function renderPdfFromSvg({ svgPath, svgPaths, pdfPath }) {
+  const pages = Array.isArray(svgPaths) && svgPaths.length ? svgPaths : [svgPath];
   const doc = new PDFDocument({
     size: "A4",
     layout: "landscape",
@@ -500,13 +687,19 @@ async function renderPdfFromSvg({ svgPath, pdfPath }) {
   const stream = fs.createWriteStream(pdfPath);
   doc.pipe(stream);
 
-  const svgSource = fs.readFileSync(svgPath, "utf8");
-  SVGtoPDF(doc, svgSource, 0, 0, {
-    assumePt: true,
-    width: PAGE_WIDTH,
-    height: PAGE_HEIGHT,
-    imageCallback: (href) => path.resolve(path.dirname(svgPath), String(href || "")),
-  });
+  for (let index = 0; index < pages.length; index += 1) {
+    if (index > 0) {
+      doc.addPage({ size: "A4", layout: "landscape", margin: 0 });
+    }
+    const currentSvgPath = pages[index];
+    const svgSource = fs.readFileSync(currentSvgPath, "utf8");
+    SVGtoPDF(doc, svgSource, 0, 0, {
+      assumePt: true,
+      width: PAGE_WIDTH,
+      height: PAGE_HEIGHT,
+      imageCallback: (href) => path.resolve(path.dirname(currentSvgPath), String(href || "")),
+    });
+  }
 
   doc.end();
   await new Promise((resolve, reject) => {
@@ -561,11 +754,11 @@ async function generatePdfFromResult({ result, cedula, fecha, outputName = "", o
   const baseName = resolveBaseName(cedula, fecha, outputName);
   const pdfPath = path.join(outDir, `${baseName}.pdf`);
   const jsonPath = path.join(outDir, `${baseName}.json`);
-  const { svgPath } = generateSvgFromResult({ result, cedula, fecha, outputName, outputDir });
-  await renderPdfFromSvg({ svgPath, pdfPath });
+  const { svgPath, svgPaths } = generateSvgFromResult({ result, cedula, fecha, outputName, outputDir });
+  await renderPdfFromSvg({ svgPath, svgPaths, pdfPath });
 
   fs.writeFileSync(jsonPath, JSON.stringify(result, null, 2), "utf8");
-  return { pdfPath, jsonPath, svgPath };
+  return { pdfPath, jsonPath, svgPath, svgPaths };
 }
 
 if (require.main === module) {
