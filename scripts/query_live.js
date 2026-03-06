@@ -1,11 +1,15 @@
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const https = require("https");
 const CryptoJS = require("crypto-js");
+const { getHttpsAgent, loadEnvFile } = require("./runtime_config");
 
 const BASE_URL = "https://coberturasalud.msp.gob.ec/";
 const ACTION_GET_CAPTCHA = "40e5613a02e25c0dfb759fd7f199149081432edf13";
 const ACTION_API_CLIENT = "70987a4dcfb783907102d476e4a450486019bbcc62";
+
+loadEnvFile();
 
 function parseArgs(argv) {
   const args = {};
@@ -58,25 +62,66 @@ function parseRscPayload(text) {
 }
 
 function extractCookie(headers) {
-  const setCookie = headers.get("set-cookie");
+  const setCookieHeader = headers["set-cookie"];
+  const setCookie = Array.isArray(setCookieHeader) ? setCookieHeader[0] : setCookieHeader;
   if (!setCookie) {
     return "";
   }
   return setCookie.split(";")[0];
 }
 
+function postText(url, headers, body) {
+  return new Promise((resolve, reject) => {
+    const payload = String(body);
+    const request = https.request(
+      url,
+      {
+        method: "POST",
+        headers: {
+          ...headers,
+          "content-length": Buffer.byteLength(payload),
+        },
+        agent: getHttpsAgent(),
+      },
+      (response) => {
+        let chunks = "";
+        response.setEncoding("utf8");
+        response.on("data", (chunk) => {
+          chunks += chunk;
+        });
+        response.on("end", () => {
+          resolve({
+            status: response.statusCode || 0,
+            headers: response.headers,
+            body: chunks,
+          });
+        });
+      }
+    );
+
+    request.on("error", (error) => {
+      const tlsHelp =
+        "Si es un problema de certificados en Ubuntu, usa COBERTURA_TLS_INSECURE=true temporalmente o configura COBERTURA_CA_FILE.";
+      reject(new Error(`${error.message}. ${tlsHelp}`));
+    });
+
+    request.write(payload);
+    request.end();
+  });
+}
+
 async function postAction(actionId, body, cookie = "") {
-  const response = await fetch(BASE_URL, {
-    method: "POST",
-    headers: {
+  const response = await postText(
+    BASE_URL,
+    {
       "content-type": "text/plain;charset=UTF-8",
       "next-action": actionId,
       ...(cookie ? { cookie } : {}),
     },
-    body: JSON.stringify(body),
-  });
+    JSON.stringify(body)
+  );
 
-  const text = await response.text();
+  const text = response.body;
   return {
     status: response.status,
     cookie: extractCookie(response.headers) || cookie,

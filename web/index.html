@@ -142,7 +142,7 @@
 <body>
   <main class="shell">
     <section class="hero">
-      <p class="eyebrow">Windows + Node.js</p>
+      <p class="eyebrow">Linux/Ubuntu + Node.js</p>
       <h1>Carga Excel y genera PDFs</h1>
       <p class="lead">
         Sube un Excel con tres columnas: <code>nombre_pdf</code>, <code>cedula</code> y <code>fecha</code>.
@@ -180,10 +180,23 @@
     const result = document.getElementById("result");
     const summary = document.getElementById("summary");
 
-    function toPublicPath(absPath) {
-      const marker = "\\output\\";
-      const idx = absPath.indexOf(marker);
-      return idx >= 0 ? "/output/" + absPath.slice(idx + marker.length).replace(/\\\\/g, "/") : "#";
+    function toPublicPath(filePath) {
+      if (!filePath) {
+        return "#";
+      }
+      const normalized = String(filePath).replace(/\\/g, "/");
+      if (normalized.startsWith("/output/")) {
+        return encodeURI(normalized);
+      }
+      if (normalized.startsWith("output/")) {
+        return encodeURI(`/${normalized}`);
+      }
+      const marker = "/output/";
+      const idx = normalized.lastIndexOf(marker);
+      if (idx >= 0) {
+        return encodeURI(`/output/${normalized.slice(idx + marker.length)}`);
+      }
+      return "#";
     }
 
     function renderSummary(data) {

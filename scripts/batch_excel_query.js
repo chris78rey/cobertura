@@ -1,9 +1,8 @@
 const fs = require("fs");
 const path = require("path");
-const { spawnSync } = require("child_process");
 const XLSX = require("xlsx");
 const { runSingle } = require("./query_live");
-const { safeFilename } = require("./generate_pdf");
+const { generatePdfFromResult } = require("./generate_pdf");
 
 function ensureDir(dirPath) {
   fs.mkdirSync(dirPath, { recursive: true });
@@ -69,22 +68,6 @@ function validateRows(rows) {
   });
 }
 
-async function generatePdf(cedula, fecha, outputName) {
-  const result = spawnSync(
-    "node",
-    ["scripts/generate_pdf.js", "--cedula", cedula, "--fecha", fecha, "--output_name", outputName],
-    { cwd: process.cwd(), encoding: "utf8" }
-  );
-  if (result.status !== 0) {
-    throw new Error(result.stderr.trim() || result.stdout.trim() || "Fallo generando PDF.");
-  }
-  const baseName = safeFilename(outputName);
-  return {
-    pdf_path: path.resolve("output", `${baseName}.pdf`),
-    json_path: path.resolve("output", `${baseName}.json`),
-  };
-}
-
 function extractCoverageSummary(payload) {
   const data = payload && payload.response && payload.response.data ? payload.response.data : null;
   const aseguradoras =
@@ -128,13 +111,19 @@ async function processExcelFile(filePath, options = {}) {
       try {
         const startedAt = Date.now();
         const response = await runSingle(row.cedula, row.fecha);
-        const artifacts = await generatePdf(row.cedula, row.fecha, row.nombre_pdf);
+        const artifacts = await generatePdfFromResult({
+          result: response,
+          cedula: row.cedula,
+          fecha: row.fecha,
+          outputName: row.nombre_pdf,
+        });
         results.push({
           ...row,
           status: "success",
           attempts,
           duration_ms: Date.now() - startedAt,
-          ...artifacts,
+          pdf_path: artifacts.pdfPath,
+          json_path: artifacts.jsonPath,
           summary: extractCoverageSummary(response),
         });
         done = true;

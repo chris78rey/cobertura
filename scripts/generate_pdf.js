@@ -1,7 +1,12 @@
 const fs = require("fs");
 const path = require("path");
 const PDFDocument = require("pdfkit");
+const SVGtoPDF = require("svg-to-pdfkit");
 const { runSingle } = require("./query_live");
+const { loadSvgLayout } = require("./svg_layout");
+
+const PAGE_WIDTH = 841.89;
+const PAGE_HEIGHT = 595.28;
 
 function parseArgs(argv) {
   const args = {};
@@ -22,6 +27,280 @@ function ensureDir(dirPath) {
 
 function safeFilename(value) {
   return String(value).replace(/[^a-zA-Z0-9_-]/g, "_");
+}
+
+function formatCoverageDate(fechaIso) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(fechaIso || ""))) {
+    return fechaIso || "";
+  }
+  const date = new Date(`${fechaIso}T00:00:00Z`);
+  if (Number.isNaN(date.getTime())) {
+    return fechaIso;
+  }
+  return new Intl.DateTimeFormat("en-US", {
+    timeZone: "UTC",
+    day: "2-digit",
+    month: "long",
+    year: "numeric",
+  }).format(date);
+}
+
+function resolveBaseName(cedula, fecha, outputName = "") {
+  if (outputName) {
+    return safeFilename(outputName);
+  }
+  return `cobertura_${safeFilename(cedula)}_${safeFilename(fecha)}`;
+}
+
+function parsePrivados(data) {
+  const source =
+    data && data.coberturaPrivada && data.coberturaPrivada.RegistrosAsegurados
+      ? data.coberturaPrivada.RegistrosAsegurados.RegistroAsegurado
+      : [];
+
+  if (!source) {
+    return [];
+  }
+  if (Array.isArray(source)) {
+    return source;
+  }
+  return [source];
+}
+
+function escapeXml(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
+function svgAssetHref(outDir, fileName) {
+  const absoluteAssetPath = path.resolve("assets", fileName);
+  if (!fs.existsSync(absoluteAssetPath)) {
+    return "";
+  }
+  return path.relative(outDir, absoluteAssetPath).replace(/\\/g, "/");
+}
+
+function wrapText(text, width, fontSize) {
+  const raw = String(text || "-");
+  const parts = raw.split(/\n/);
+  const maxChars = Math.max(8, Math.floor(width / Math.max(1, fontSize * 0.55)));
+  const lines = [];
+  for (const part of parts) {
+    const words = part.split(/\s+/).filter(Boolean);
+    if (!words.length) {
+      lines.push("");
+      continue;
+    }
+    let current = words[0];
+    for (let index = 1; index < words.length; index += 1) {
+      const candidate = `${current} ${words[index]}`;
+      if (candidate.length <= maxChars) {
+        current = candidate;
+      } else {
+        lines.push(current);
+        current = words[index];
+      }
+    }
+    lines.push(current);
+  }
+  return lines;
+}
+
+function svgText({
+  text,
+  x,
+  y,
+  size = 10,
+  bold = false,
+  anchor = "start",
+  width = 0,
+  lineHeight = 1.2,
+  fill = "#000000",
+}) {
+  const lines = width > 0 ? wrapText(text, width, size) : String(text || "").split(/\n/);
+  const tspans = lines
+    .map((line, index) => {
+      const dy = index === 0 ? 0 : size * lineHeight;
+      return `<tspan x="${x}" dy="${dy}">${escapeXml(line)}</tspan>`;
+    })
+    .join("");
+  return `<text x="${x}" y="${y}" font-family="Helvetica" font-size="${size}" font-weight="${
+    bold ? "700" : "400"
+  }" text-anchor="${anchor}" fill="${fill}">${tspans}</text>`;
+}
+
+function svgTable({ x, y, widths, headers, rows, headerHeight, rowHeight, headerFontSize, bodyFontSize, lineWidth }) {
+  const elements = [];
+  let cursorX = x;
+  for (let index = 0; index < headers.length; index += 1) {
+    const width = widths[index];
+    elements.push(`<rect x="${cursorX}" y="${y}" width="${width}" height="${headerHeight}" fill="none" stroke="#000" stroke-width="${lineWidth}"/>`);
+    elements.push(
+      svgText({
+        text: headers[index],
+        x: cursorX + width / 2,
+        y: y + headerFontSize + 5,
+        size: headerFontSize,
+        bold: true,
+        anchor: "middle",
+        width: width - 12,
+      })
+    );
+    cursorX += width;
+  }
+
+  let rowY = y + headerHeight;
+  for (const row of rows) {
+    cursorX = x;
+    for (let index = 0; index < widths.length; index += 1) {
+      const width = widths[index];
+      elements.push(
+        `<rect x="${cursorX}" y="${rowY}" width="${width}" height="${rowHeight}" fill="none" stroke="#000" stroke-width="${lineWidth}"/>`
+      );
+      elements.push(
+        svgText({
+          text: row[index] || "-",
+          x: cursorX + 5,
+          y: rowY + bodyFontSize + 5,
+          size: bodyFontSize,
+          width: width - 10,
+        })
+      );
+      cursorX += width;
+    }
+    rowY += rowHeight;
+  }
+  return elements.join("\n");
+}
+
+function generateSvgFromResult({ result, cedula, fecha, outputName = "", outputDir = "output" }) {
+  const data = result.response.data;
+  const seguros =
+    data && data.coberturaSalud && data.coberturaSalud.CoberturaSeguros
+      ? data.coberturaSalud.CoberturaSeguros.aseguradora || []
+      : [];
+  const privados = parsePrivados(data);
+
+  const outDir = path.resolve(outputDir);
+  ensureDir(outDir);
+  const baseName = resolveBaseName(cedula, fecha, outputName);
+  const svgPath = path.join(outDir, `${baseName}.svg`);
+  const layout = loadSvgLayout();
+
+  const nombre = seguros.find((item) => item.Nombre)?.Nombre || "";
+
+  const mspHref = svgAssetHref(outDir, "logomsp.jpg");
+  const rpisHref = svgAssetHref(outDir, "logorpis.jpg");
+  const escudoHref =
+    svgAssetHref(outDir, "escudo_ec.png") || svgAssetHref(outDir, "escudo_ec.jpg") || svgAssetHref(outDir, "escudo_ec.jpeg");
+
+  const footerLogos = ["logomsp.jpg", "mininterior.jpg", "mindefensa.jpg", "iess.jpg", "issfa.jpg", "isspol.jpg"];
+  const footerSizes = [
+    [76, 22],
+    [76, 22],
+    [76, 22],
+    [46, 22],
+    [46, 22],
+    [46, 22],
+  ];
+
+  let footerX = PAGE_WIDTH / 2 - 205;
+  const footerImages = [];
+  for (let index = 0; index < footerLogos.length; index += 1) {
+    const href = svgAssetHref(outDir, footerLogos[index]);
+    const [width, height] = footerSizes[index];
+    if (href) {
+      footerImages.push(`<image href="${escapeXml(href)}" x="${footerX}" y="${PAGE_HEIGHT - 99}" width="${width}" height="${height}"/>`);
+    } else {
+      footerImages.push(`<rect x="${footerX}" y="${PAGE_HEIGHT - 99}" width="${width}" height="${height}" fill="none" stroke="#000" stroke-width="0.8"/>`);
+    }
+    footerX += width + 16;
+  }
+
+  const privateRows = privados.length
+    ? privados.map((item) => [
+        item.RucEmpresa || "",
+        item.NombreFinanciador || "",
+        item.IdentificacionBeneficiario || "",
+        item.NombreBeneficiario || "",
+        item.ApellidosBeneficiario || "",
+      ])
+    : [["NO EXISTEN RESULTADOS PARA LOS PARAMETROS INGRESADOS", "", "", "", ""]];
+
+  const escudoScale = 0.84;
+  const escudoWidth = layout.escudo.width * escudoScale;
+  const escudoHeight = layout.escudo.height * escudoScale;
+  const escudoX = layout.escudo.x + (layout.escudo.width - escudoWidth) / 2;
+  const escudoY = layout.escudo.y + (layout.escudo.height - escudoHeight) / 2;
+
+  const svg = `<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="${PAGE_WIDTH}" height="${PAGE_HEIGHT}" viewBox="0 0 ${PAGE_WIDTH} ${PAGE_HEIGHT}">
+  <line x1="20" y1="${layout.headerLineY}" x2="${PAGE_WIDTH - 20}" y2="${layout.headerLineY}" stroke="#000" stroke-width="1.1"/>
+  ${mspHref ? `<image href="${escapeXml(mspHref)}" x="${layout.mspLogo.x}" y="${layout.mspLogo.y}" width="${layout.mspLogo.width}" height="${layout.mspLogo.height}"/>` : ""}
+  ${rpisHref ? `<image href="${escapeXml(rpisHref)}" x="${layout.rpisLogo.x}" y="${layout.rpisLogo.y}" width="${layout.rpisLogo.width}" height="${layout.rpisLogo.height}"/>` : ""}
+  ${escudoHref ? `<image href="${escapeXml(escudoHref)}" x="${escudoX}" y="${escudoY}" width="${escudoWidth}" height="${escudoHeight}" opacity="0.62"/>` : `<rect x="${layout.escudo.x}" y="${layout.escudo.y}" width="${layout.escudo.width}" height="${layout.escudo.height}" fill="none" stroke="#000" stroke-width="1"/>${svgText({ text: "EC", x: layout.escudo.x + layout.escudo.width / 2, y: layout.escudo.y + layout.escudo.height / 2 + 5, size: 13, bold: true, anchor: "middle" })}`}
+
+  ${svgText({ text: "RED PUBLICA INTEGRAL DE SALUD", x: PAGE_WIDTH / 2, y: 100, size: 13.5, bold: true, anchor: "middle" })}
+  ${svgText({ text: "CONSULTA DE COBERTURA DE SALUD", x: PAGE_WIDTH / 2, y: 128, size: 10.5, bold: true, anchor: "middle" })}
+  ${svgText({ text: nombre, x: 50, y: 152, size: 7.8, bold: true })}
+  ${svgText({ text: "Numero de documento de Identificacion:", x: 50, y: 174, size: 8.2, bold: true })}
+  ${svgText({ text: cedula, x: 272, y: 174, size: 8.2 })}
+  ${svgText({ text: "Fecha de Cobertura de Seguro de Salud:", x: 420, y: 174, size: 8.2, bold: true })}
+  ${svgText({ text: formatCoverageDate(fecha), x: PAGE_WIDTH - 50, y: 174, size: 8.2, anchor: "end" })}
+  ${svgText({ text: "IESS, ISSFA, ISSPOL", x: PAGE_WIDTH / 2, y: 194, size: 8.3, bold: true, anchor: "middle" })}
+
+  ${svgTable({
+    x: 50,
+    y: 202,
+    widths: [92, 188, 255, 195],
+    headers: ["Seguro", "Tipo de seguro", "Mensaje", "Registro de Cobertura\nde Atencion de Salud"],
+    rows: seguros.map((item) => [
+      item.NombreInstitucion || "",
+      item.TipoSeguro || "Servicio no disponible",
+      item.MensajeServicioExterno || "Servicio no disponible",
+      item.EstadoCobertura || "Servicio no disponible",
+    ]),
+    headerHeight: 26,
+    rowHeight: 31,
+    headerFontSize: 7.6,
+    bodyFontSize: 7.1,
+    lineWidth: 0.55,
+  })}
+
+  ${svgText({ text: "* La informacion historica reflejada corresponde a datos\ndesde Junio 2010", x: 70, y: 350, size: 6.2, fill: "#0000ff" })}
+  ${svgText({ text: "RED PRIVADA COMPLEMENTARIA", x: 70, y: 368, size: 8, bold: true })}
+
+  ${svgTable({
+    x: 50,
+    y: 382,
+    widths: [104, 248, 150, 105, 108],
+    headers: ["RUC", "Nombre del Financiador", "Identificacion del\nBeneficiario", "Nombres", "Apellidos"],
+    rows: privateRows,
+    headerHeight: 20,
+    rowHeight: 19,
+    headerFontSize: 7.2,
+    bodyFontSize: 6.9,
+    lineWidth: 0.55,
+  })}
+
+  ${svgText({ text: "Fecha de consulta:", x: 488, y: 444, size: 8.3, bold: true })}
+  ${svgText({ text: new Date().toISOString().slice(0, 16).replace("T", " "), x: 690, y: 444, size: 8.3, anchor: "end" })}
+
+  <line x1="20" y1="${PAGE_HEIGHT - 108}" x2="${PAGE_WIDTH - 20}" y2="${PAGE_HEIGHT - 108}" stroke="#000" stroke-width="1.1"/>
+  ${footerImages.join("\n")}
+  <line x1="20" y1="${PAGE_HEIGHT - 76}" x2="${PAGE_WIDTH - 20}" y2="${PAGE_HEIGHT - 76}" stroke="#000" stroke-width="1.1"/>
+  ${svgText({ text: "1 / 1", x: PAGE_WIDTH / 2, y: PAGE_HEIGHT - 61, size: 7.2, anchor: "middle" })}
+  ${svgText({ text: "Plataforma Gubernamental de Desarrollo Social", x: PAGE_WIDTH - 34, y: PAGE_HEIGHT - 69, size: 6.8, anchor: "end" })}
+  ${svgText({ text: "Av. Quitumbe Nan y Amaru Nan", x: PAGE_WIDTH - 34, y: PAGE_HEIGHT - 57, size: 6.8, anchor: "end" })}
+  ${svgText({ text: "Telf: 593 (2) 3814400  |  www.msp.gob.ec", x: PAGE_WIDTH - 34, y: PAGE_HEIGHT - 45, size: 6.8, anchor: "end" })}
+</svg>`;
+
+  fs.writeFileSync(svgPath, svg, "utf8");
+  return { svgPath };
 }
 
 function writeLabelValue(doc, label, value, options = {}) {
@@ -46,32 +325,39 @@ function writeLabelValue(doc, label, value, options = {}) {
 }
 
 function drawTable(doc, headers, rows, widths, options = {}) {
-  const startX = 50;
+  const startX = options.startX || 50;
   const headerHeight = options.headerHeight || 24;
   const rowHeight = options.rowHeight || 36;
   const headerFontSize = options.headerFontSize || 9;
+  const bodyFontSize = options.bodyFontSize || 8.5;
   const headerTopPadding = options.headerTopPadding || 7;
+  const cellPaddingX = options.cellPaddingX || 6;
+  const cellPaddingY = options.cellPaddingY || 6;
+  const lineWidth = options.lineWidth || 0.6;
   let y = options.y || doc.y;
 
-  doc.lineWidth(0.8);
+  doc.lineWidth(lineWidth);
   doc.font("Helvetica-Bold").fontSize(headerFontSize);
   let x = startX;
   headers.forEach((header, index) => {
     doc.rect(x, y, widths[index], headerHeight).stroke();
-    doc.text(header, x + 6, y + headerTopPadding, {
-      width: widths[index] - 12,
+    doc.text(header, x + cellPaddingX, y + headerTopPadding, {
+      width: widths[index] - cellPaddingX * 2,
       align: "center",
     });
     x += widths[index];
   });
 
   y += headerHeight;
-  doc.font("Helvetica").fontSize(8.5);
+  doc.font("Helvetica").fontSize(bodyFontSize);
   rows.forEach((row) => {
     x = startX;
     row.forEach((cell, index) => {
       doc.rect(x, y, widths[index], rowHeight).stroke();
-      doc.text(cell || "-", x + 6, y + 6, { width: widths[index] - 12, height: rowHeight - 8 });
+      doc.text(cell || "-", x + cellPaddingX, y + cellPaddingY, {
+        width: widths[index] - cellPaddingX * 2,
+        height: rowHeight - cellPaddingY * 2,
+      });
       x += widths[index];
     });
     y += rowHeight;
@@ -84,24 +370,63 @@ function drawTable(doc, headers, rows, widths, options = {}) {
 function drawHeader(doc, pageWidth) {
   const previousX = doc.x;
   const previousY = doc.y;
-  doc.lineWidth(1.5);
-  doc.moveTo(20, 46).lineTo(pageWidth - 20, 46).stroke();
-  doc.moveTo(20, 92).lineTo(pageWidth - 20, 92).stroke();
+  const layout = loadSvgLayout();
+  doc.lineWidth(1.1);
+  doc.moveTo(20, layout.headerLineY).lineTo(pageWidth - 20, layout.headerLineY).stroke();
   const mspLogo = path.resolve("assets", "logomsp.jpg");
   const rpisLogo = path.resolve("assets", "logorpis.jpg");
+  const escudoCandidates = [
+    path.resolve("assets", "escudo_ec.png"),
+    path.resolve("assets", "escudo_ec.jpg"),
+    path.resolve("assets", "escudo_ec.jpeg"),
+  ];
+  const escudoAsset = escudoCandidates.find((candidate) => fs.existsSync(candidate));
+
   if (fs.existsSync(mspLogo)) {
-    doc.image(mspLogo, 24, 52, { fit: [120, 30], align: "left", valign: "center" });
+    doc.image(mspLogo, layout.mspLogo.x, layout.mspLogo.y, {
+      fit: [layout.mspLogo.width, layout.mspLogo.height],
+      align: "left",
+      valign: "center",
+    });
   } else {
-    doc.rect(24, 52, 120, 30).stroke();
-    doc.font("Helvetica-Bold").fontSize(12).text("MSP", 68, 61, { align: "center", width: 32 });
+    doc.rect(layout.mspLogo.x, layout.mspLogo.y, layout.mspLogo.width, layout.mspLogo.height).stroke();
+    doc.font("Helvetica-Bold").fontSize(10).text("MSP", layout.mspLogo.x + 44, layout.mspLogo.y + 4, {
+      align: "center",
+      width: 32,
+      lineBreak: false,
+    });
   }
 
   if (fs.existsSync(rpisLogo)) {
-    doc.image(rpisLogo, pageWidth / 2 - 55, 56, { fit: [110, 26], align: "center", valign: "center" });
+    doc.image(rpisLogo, layout.rpisLogo.x, layout.rpisLogo.y, {
+      fit: [layout.rpisLogo.width, layout.rpisLogo.height],
+      align: "right",
+      valign: "center",
+    });
   }
 
-  doc.rect(pageWidth - 70, 52, 30, 30).stroke();
-  doc.font("Helvetica-Bold").fontSize(11).text("EC", pageWidth - 63, 61, { width: 16, align: "center" });
+  if (escudoAsset) {
+    const escudoScale = 0.84;
+    const escudoWidth = layout.escudo.width * escudoScale;
+    const escudoHeight = layout.escudo.height * escudoScale;
+    const escudoX = layout.escudo.x + (layout.escudo.width - escudoWidth) / 2;
+    const escudoY = layout.escudo.y + (layout.escudo.height - escudoHeight) / 2;
+    doc.save();
+    doc.opacity(0.62);
+    doc.image(escudoAsset, escudoX, escudoY, {
+      fit: [escudoWidth, escudoHeight],
+      align: "center",
+      valign: "center",
+    });
+    doc.restore();
+  } else {
+    doc.rect(layout.escudo.x, layout.escudo.y, layout.escudo.width, layout.escudo.height).stroke();
+    doc.font("Helvetica-Bold").fontSize(13).text("EC", layout.escudo.x + 8, layout.escudo.y + 12, {
+      width: Math.max(1, layout.escudo.width - 16),
+      align: "center",
+      lineBreak: false,
+    });
+  }
   doc.x = previousX;
   doc.y = previousY;
 }
@@ -109,18 +434,18 @@ function drawHeader(doc, pageWidth) {
 function drawFooter(doc, pageWidth, pageHeight) {
   const previousX = doc.x;
   const previousY = doc.y;
-  const footerInfoX = pageWidth - 205;
-  const footerInfoWidth = 170;
-  doc.lineWidth(1.5);
+  const footerInfoX = pageWidth - 212;
+  const footerInfoWidth = 178;
+  doc.lineWidth(1.1);
   doc.moveTo(20, pageHeight - 108).lineTo(pageWidth - 20, pageHeight - 108).stroke();
-  const logoY = pageHeight - 101;
+  const logoY = pageHeight - 99;
   const logos = [
-    ["logomsp.jpg", 80, 24],
-    ["mininterior.jpg", 80, 24],
-    ["mindefensa.jpg", 80, 24],
-    ["iess.jpg", 50, 24],
-    ["issfa.jpg", 50, 24],
-    ["isspol.jpg", 50, 24],
+    ["logomsp.jpg", 76, 22],
+    ["mininterior.jpg", 76, 22],
+    ["mindefensa.jpg", 76, 22],
+    ["iess.jpg", 46, 22],
+    ["issfa.jpg", 46, 22],
+    ["isspol.jpg", 46, 22],
   ];
   let x = pageWidth / 2 - 205;
   logos.forEach(([fileName, width, height]) => {
@@ -134,19 +459,19 @@ function drawFooter(doc, pageWidth, pageHeight) {
   });
 
   doc.moveTo(20, pageHeight - 76).lineTo(pageWidth - 20, pageHeight - 76).stroke();
-  doc.font("Helvetica").fontSize(8);
-  doc.text("1 / 1", pageWidth / 2 - 10, pageHeight - 66, { width: 20, align: "center", lineBreak: false });
-  doc.text("Plataforma Gubernamental de Desarrollo Social", footerInfoX, pageHeight - 70, {
+  doc.font("Helvetica").fontSize(6.8);
+  doc.text("1 / 1", pageWidth / 2 - 10, pageHeight - 65, { width: 20, align: "center", lineBreak: false });
+  doc.text("Plataforma Gubernamental de Desarrollo Social", footerInfoX, pageHeight - 68, {
     width: footerInfoWidth,
     align: "right",
     lineBreak: false,
   });
-  doc.text("Av. Quitumbe Nan y Amaru Nan", footerInfoX, pageHeight - 58, {
+  doc.text("Av. Quitumbe Nan y Amaru Nan", footerInfoX, pageHeight - 56, {
     width: footerInfoWidth,
     align: "right",
     lineBreak: false,
   });
-  doc.text("Telf: 593 (2) 3814400  |  www.msp.gob.ec", footerInfoX, pageHeight - 46, {
+  doc.text("Telf: 593 (2) 3814400  |  www.msp.gob.ec", footerInfoX, pageHeight - 44, {
     width: footerInfoWidth,
     align: "right",
     lineBreak: false,
@@ -166,159 +491,81 @@ function applyChromeToAllPages(doc) {
   }
 }
 
+async function renderPdfFromSvg({ svgPath, pdfPath }) {
+  const doc = new PDFDocument({
+    size: "A4",
+    layout: "landscape",
+    margin: 0,
+  });
+  const stream = fs.createWriteStream(pdfPath);
+  doc.pipe(stream);
+
+  const svgSource = fs.readFileSync(svgPath, "utf8");
+  SVGtoPDF(doc, svgSource, 0, 0, {
+    assumePt: true,
+    width: PAGE_WIDTH,
+    height: PAGE_HEIGHT,
+    imageCallback: (href) => path.resolve(path.dirname(svgPath), String(href || "")),
+  });
+
+  doc.end();
+  await new Promise((resolve, reject) => {
+    stream.on("finish", resolve);
+    stream.on("error", reject);
+  });
+}
+
 async function main() {
   const args = parseArgs(process.argv);
   if (!args.cedula || !args.fecha) {
     throw new Error("Usa --cedula y --fecha.");
   }
 
-  const result = await runSingle(args.cedula, args.fecha);
-  const data = result.response.data;
-  const seguros = data.coberturaSalud.CoberturaSeguros.aseguradora || [];
-  const privados =
-    (data.coberturaPrivada.RegistrosAsegurados &&
-      data.coberturaPrivada.RegistrosAsegurados.RegistroAsegurado) ||
-    [];
+  let result;
+  if (args.input_json) {
+    const sourcePath = path.resolve(args.input_json);
+    if (!fs.existsSync(sourcePath)) {
+      throw new Error(`No existe input_json: ${sourcePath}`);
+    }
+    result = JSON.parse(fs.readFileSync(sourcePath, "utf8"));
+  } else {
+    result = await runSingle(args.cedula, args.fecha);
+  }
 
-  const outDir = path.resolve("output");
+  const artifacts = await generatePdfFromResult({
+    result,
+    cedula: args.cedula,
+    fecha: args.fecha,
+    outputName: args.output_name || "",
+  });
+  console.log(JSON.stringify(artifacts, null, 2));
+}
+
+async function generatePdfFromResult({ result, cedula, fecha, outputName = "", outputDir = "output" }) {
+  if (!result || !result.response || !result.response.data) {
+    throw new Error("Resultado invalido para generar PDF.");
+  }
+  if (!cedula || !fecha) {
+    throw new Error("Se requiere cedula y fecha para generar PDF.");
+  }
+
+  const data = result.response.data;
+  const seguros =
+    data && data.coberturaSalud && data.coberturaSalud.CoberturaSeguros
+      ? data.coberturaSalud.CoberturaSeguros.aseguradora || []
+      : [];
+  const privados = parsePrivados(data);
+
+  const outDir = path.resolve(outputDir);
   ensureDir(outDir);
-  const baseName = args.output_name
-    ? safeFilename(args.output_name)
-    : `cobertura_${safeFilename(args.cedula)}_${safeFilename(args.fecha)}`;
+  const baseName = resolveBaseName(cedula, fecha, outputName);
   const pdfPath = path.join(outDir, `${baseName}.pdf`);
   const jsonPath = path.join(outDir, `${baseName}.json`);
-
-  const doc = new PDFDocument({
-    size: "A4",
-    layout: "landscape",
-    margin: 30,
-    bufferPages: true,
-  });
-  const stream = fs.createWriteStream(pdfPath);
-  doc.pipe(stream);
-  const pageWidth = doc.page.width;
-  const pageHeight = doc.page.height;
-  const contentX = 30;
-  const contentWidth = pageWidth - 60;
-  const privatePanelX = 70;
-  const privatePanelWidth = 260;
-  const titleY = 108;
-  const subtitleY = 136;
-  const nameY = 160;
-  const metaY = 184;
-  const sectionY = 208;
-  const tableY = 230;
-  const noteY = 420;
-  const privateTitleY = 440;
-  const privateBodyY = 462;
-  const consultY = 468;
-
-  doc.font("Helvetica-Bold").fontSize(15).text("RED PUBLICA INTEGRAL DE SALUD", contentX, titleY, {
-    width: contentWidth,
-    align: "center",
-    lineBreak: false,
-  });
-  doc.font("Helvetica-Bold").fontSize(12).text("CONSULTA DE COBERTURA DE SALUD", contentX, subtitleY, {
-    width: contentWidth,
-    align: "center",
-    lineBreak: false,
-  });
-
-  const nombre = seguros.find((item) => item.Nombre)?.Nombre || "";
-  if (nombre) {
-    doc.font("Helvetica-Bold").fontSize(10).text(nombre, 50, nameY, {
-      width: 320,
-      lineBreak: false,
-    });
-  }
-
-  writeLabelValue(doc, "Numero de documento de Identificacion: ", args.cedula, {
-    x: 50,
-    y: metaY,
-    labelWidth: 210,
-    valueWidth: 120,
-    size: 10,
-  });
-  writeLabelValue(doc, "Fecha de Cobertura de Seguro de Salud: ", args.fecha, {
-    x: 420,
-    y: metaY,
-    labelWidth: 250,
-    valueWidth: 95,
-    align: "right",
-    size: 10,
-  });
-
-  doc.font("Helvetica-Bold").fontSize(10).text("IESS, ISSFA, ISSPOL", contentX, sectionY, {
-    width: contentWidth,
-    align: "center",
-    lineBreak: false,
-  });
-  drawTable(
-    doc,
-    ["Seguro", "Tipo de seguro", "Mensaje", "Registro de Cobertura\nde Atencion de Salud"],
-    seguros.map((item) => [
-      item.NombreInstitucion || "",
-      item.TipoSeguro || "Servicio no disponible",
-      item.MensajeServicioExterno || "Servicio no disponible",
-      item.EstadoCobertura || "Servicio no disponible",
-    ]),
-    [90, 190, 255, 195],
-    { y: tableY, rowHeight: 34, headerHeight: 30, headerFontSize: 8.5, headerTopPadding: 5 }
-  );
-
-  doc.font("Helvetica").fontSize(7).fillColor("blue").text(
-    "* La informacion historica reflejada corresponde a datos\ndesde Junio 2010",
-    privatePanelX,
-    noteY,
-    { width: privatePanelWidth }
-  );
-  doc.fillColor("black");
-
-  doc.font("Helvetica-Bold").fontSize(9).text("RED PRIVADA COMPLEMENTARIA", privatePanelX, privateTitleY, {
-    width: privatePanelWidth,
-  });
-
-  if (privados.length) {
-    drawTable(
-      doc,
-      ["RUC", "Nombre del Financiador", "Identificacion del Beneficiario", "Nombres", "Apellidos"],
-      privados.map((item) => [
-        item.RucEmpresa || "",
-        item.NombreFinanciador || "",
-        item.IdentificacionBeneficiario || "",
-        item.NombreBeneficiario || "",
-        item.ApellidosBeneficiario || "",
-      ]),
-      [100, 240, 135, 120, 120],
-      { y: privateBodyY, rowHeight: 28, headerHeight: 22 }
-    );
-  } else {
-    doc.font("Helvetica").fontSize(8.5).text(
-      "NO EXISTEN RESULTADOS PARA LOS\nPARAMETROS INGRESADOS",
-      privatePanelX,
-      privateBodyY,
-      { width: privatePanelWidth }
-    );
-  }
-
-  writeLabelValue(doc, "Fecha de consulta: ", new Date().toISOString().slice(0, 16).replace("T", " "), {
-    x: 500,
-    y: consultY,
-    labelWidth: 115,
-    valueWidth: 110,
-    align: "right",
-    size: 9,
-  });
-  applyChromeToAllPages(doc);
-  doc.end();
-
-  await new Promise((resolve, reject) => {
-    stream.on("finish", resolve);
-    stream.on("error", reject);
-  });
+  const { svgPath } = generateSvgFromResult({ result, cedula, fecha, outputName, outputDir });
+  await renderPdfFromSvg({ svgPath, pdfPath });
 
   fs.writeFileSync(jsonPath, JSON.stringify(result, null, 2), "utf8");
-  console.log(JSON.stringify({ pdfPath, jsonPath }, null, 2));
+  return { pdfPath, jsonPath, svgPath };
 }
 
 if (require.main === module) {
@@ -330,4 +577,5 @@ if (require.main === module) {
 
 module.exports = {
   safeFilename,
+  generatePdfFromResult,
 };

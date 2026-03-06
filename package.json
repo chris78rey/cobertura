@@ -10,6 +10,7 @@
     "pdfjs-dist": "^5.5.207",
     "pdfkit": "^0.17.2",
     "playwright": "^1.58.2",
+    "svg-to-pdfkit": "^0.1.8",
     "xlsx": "^0.18.5"
   }
 }

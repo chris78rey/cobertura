@@ -10,3 +10,5 @@ tmp_*.html
 network_log.json
 
 *.log
+
+.env
