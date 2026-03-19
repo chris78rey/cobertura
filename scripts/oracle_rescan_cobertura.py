@@ -3,6 +3,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -149,7 +150,7 @@ def fetch_pending_rows(
     sql = f"""
     SELECT *
     FROM (
-      SELECT DIG_ID, DIG_CEDULA, DIG_FECHA_PLANILLA, DIG_COBERTURA
+      SELECT DIG_ID, DIG_TRAMITE, DIG_CEDULA, DIG_DEPENDIENTE_01, DIG_DEPENDIENTE_02, DIG_FECHA_PLANILLA, DIG_COBERTURA
       FROM DIGITALIZACION.DIGITALIZACION
       WHERE NVL(DIG_COBERTURA, 'N') = :pending
         AND DIG_CEDULA IS NOT NULL
@@ -163,11 +164,22 @@ def fetch_pending_rows(
     try:
         cur.execute(sql, pending=pending_value, max_rows=limit)
         rows = []
-        for dig_id, dig_cedula, dig_fecha_planilla, dig_cobertura in cur.fetchall():
+        for (
+            dig_id,
+            dig_tramite,
+            dig_cedula,
+            dig_dependiente_01,
+            dig_dependiente_02,
+            dig_fecha_planilla,
+            dig_cobertura,
+        ) in cur.fetchall():
             rows.append(
                 {
                     "dig_id": int(dig_id),
+                    "dig_tramite": int(dig_tramite) if dig_tramite is not None else None,
                     "dig_cedula": str(dig_cedula).strip(),
+                    "dig_dependiente_01": str(dig_dependiente_01).strip() if dig_dependiente_01 else "",
+                    "dig_dependiente_02": str(dig_dependiente_02).strip() if dig_dependiente_02 else "",
                     "dig_fecha_planilla": dig_fecha_planilla,
                     "dig_cobertura": dig_cobertura,
                 }
@@ -219,12 +231,75 @@ def is_coverage_generated(result: Dict[str, Any]) -> bool:
     return success == "success" and isinstance(data, dict) and data.get("status") in ("200", 200)
 
 
-def save_result(output_dir: Path, dig_id: int, cedula: str, fecha_iso: str, result: Dict[str, Any]) -> Path:
+def save_result(output_dir: Path, dig_id: int, tramite: int | None, cedula: str, fecha_iso: str, result: Dict[str, Any]) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
-    filename = f"dig_{dig_id}_{cedula}_{fecha_iso}.json"
+    if tramite is not None:
+        filename = f"cc_{tramite}_{cedula}_{fecha_iso}.json"
+    else:
+        filename = f"dig_{dig_id}_{cedula}_{fecha_iso}.json"
     path = output_dir / filename
     path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     return path
+
+
+def merge_pdfs(pdf_paths: List[str], merged_output_path: Path) -> str:
+    valid_paths = [path for path in pdf_paths if path]
+    if not valid_paths:
+        raise RuntimeError("No hay PDFs para unificar")
+    if len(valid_paths) == 1:
+        merged_output_path.parent.mkdir(parents=True, exist_ok=True)
+        source = Path(valid_paths[0]).resolve()
+        target = merged_output_path.resolve()
+        if source != target:
+            shutil.copyfile(source, target)
+        return str(target)
+
+    merged_output_path.parent.mkdir(parents=True, exist_ok=True)
+    command = ["pdfunite", *valid_paths, str(merged_output_path)]
+    proc = subprocess.run(command, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "Fallo pdfunite")
+    return str(merged_output_path)
+
+
+def normalize_result_for_pdf(result: Dict[str, Any]) -> Dict[str, Any]:
+    payload = result if isinstance(result, dict) else {}
+    response = payload.get("response") if isinstance(payload.get("response"), dict) else {}
+    data = response.get("data") if isinstance(response.get("data"), dict) else {}
+
+    if not data:
+        data = {
+            "status": "204",
+            "coberturaSalud": {"CoberturaSeguros": {"aseguradora": []}},
+            "coberturaPrivada": {"RegistrosAsegurados": {"RegistroAsegurado": []}},
+        }
+
+    response["data"] = data
+    payload["response"] = response
+    return payload
+
+
+def build_cedula_targets(row: Dict[str, Any]) -> List[Dict[str, str]]:
+    targets = [
+        {"slot": "titular", "cedula": str(row.get("dig_cedula") or "").strip(), "order": 1},
+        {"slot": "dependiente_01", "cedula": str(row.get("dig_dependiente_01") or "").strip(), "order": 2},
+        {"slot": "dependiente_02", "cedula": str(row.get("dig_dependiente_02") or "").strip(), "order": 3},
+    ]
+    valid_targets: List[Dict[str, str]] = []
+    seen = set()
+    for target in targets:
+        cedula = target["cedula"]
+        if not cedula:
+            continue
+        if not re.fullmatch(r"\d{10}", cedula):
+            raise ValueError(f"{target['slot']} invalida: '{cedula}'")
+        if cedula in seen:
+            continue
+        seen.add(cedula)
+        valid_targets.append(target)
+    if not valid_targets:
+        raise ValueError("No hay cedulas validas en titular/dependientes")
+    return valid_targets
 
 
 def mark_done(conn, dig_id: int, pending_value: str, done_value: str) -> int:
@@ -245,13 +320,17 @@ def mark_done(conn, dig_id: int, pending_value: str, done_value: str) -> int:
 
 def generate_pdf_from_saved_json(
     dig_id: int,
+    tramite: int | None,
     cedula: str,
     fecha_iso: str,
     json_path: Path,
     keep_svg: bool,
     keep_generated_json: bool,
 ) -> str:
-    output_name = f"oracle_{dig_id}_{cedula}_{fecha_iso}"
+    if tramite is not None:
+        output_name = f"cc_{tramite}_{cedula}_{fecha_iso}"
+    else:
+        output_name = f"oracle_{dig_id}_{cedula}_{fecha_iso}"
     command = [
         "node",
         "scripts/generate_pdf.js",
@@ -278,21 +357,7 @@ def generate_pdf_from_saved_json(
     generated_json_path = artifacts.get("jsonPath")
     pdf_path = artifacts.get("pdfPath")
 
-    if not keep_svg:
-        candidates = [path for path in [svg_path, *svg_paths] if path]
-        for candidate in candidates:
-            try:
-                Path(candidate).unlink(missing_ok=True)
-            except Exception:
-                pass
-
-    if generated_json_path and not keep_generated_json:
-        generated_json = Path(generated_json_path)
-        if generated_json.resolve() != json_path.resolve():
-            try:
-                generated_json.unlink(missing_ok=True)
-            except Exception:
-                pass
+    # Se conservan SVG y JSON generados para trazabilidad y auditoria.
 
     return str(pdf_path or "")
 
@@ -304,23 +369,53 @@ def flush_pdf_batch(
 ) -> tuple[int, int]:
     ok = 0
     fail = 0
+    grouped: Dict[tuple[int, int | None, str], List[Dict[str, Any]]] = {}
     for item in items:
-        try:
-            pdf_path = generate_pdf_from_saved_json(
-                dig_id=item["dig_id"],
-                cedula=item["cedula"],
-                fecha_iso=item["fecha_iso"],
-                json_path=item["json_path"],
-                keep_svg=keep_svg,
-                keep_generated_json=keep_generated_json,
-            )
-            print(
-                f"PDF OK DIG_ID={item['dig_id']} cedula={item['cedula']} fecha={item['fecha_iso']} pdf={pdf_path}"
-            )
-            ok += 1
-        except Exception as exc:
-            print(f"PDF fallo DIG_ID={item['dig_id']}: {exc}", file=sys.stderr)
-            fail += 1
+        key = (item["dig_id"], item.get("dig_tramite"), item["fecha_iso"])
+        grouped.setdefault(key, []).append(item)
+
+    for (dig_id, dig_tramite, fecha_iso), group in grouped.items():
+        group_sorted = sorted(group, key=lambda current: int(current.get("order", 99)))
+        generated_paths: List[str] = []
+        group_failed = False
+
+        for item in group_sorted:
+            try:
+                pdf_path = generate_pdf_from_saved_json(
+                    dig_id=item["dig_id"],
+                    tramite=item.get("dig_tramite"),
+                    cedula=item["cedula"],
+                    fecha_iso=item["fecha_iso"],
+                    json_path=item["json_path"],
+                    keep_svg=keep_svg,
+                    keep_generated_json=keep_generated_json,
+                )
+                generated_paths.append(pdf_path)
+                print(
+                    f"PDF OK DIG_ID={item['dig_id']} slot={item['slot']} cedula={item['cedula']} fecha={item['fecha_iso']} pdf={pdf_path}"
+                )
+                ok += 1
+            except Exception as exc:
+                print(
+                    f"PDF fallo DIG_ID={item['dig_id']} slot={item['slot']} cedula={item['cedula']}: {exc}",
+                    file=sys.stderr,
+                )
+                fail += 1
+                group_failed = True
+
+        if generated_paths and not group_failed:
+            try:
+                if dig_tramite is not None:
+                    merged_name = f"CC_{dig_tramite}.pdf"
+                else:
+                    merged_name = f"oracle_{dig_id}_{fecha_iso}_unificado.pdf"
+                merged_path = Path("output") / merged_name
+                merged_pdf = merge_pdfs(generated_paths, merged_path)
+                print(f"PDF UNIFICADO OK DIG_ID={dig_id} fecha={fecha_iso} pdf={merged_pdf}")
+            except Exception as exc:
+                print(f"PDF unificado fallo DIG_ID={dig_id}: {exc}", file=sys.stderr)
+                fail += 1
+
     return ok, fail
 
 
@@ -340,6 +435,10 @@ def main() -> int:
     pdf_ok = 0
     pdf_fail = 0
     handled = 0
+    cedulas_total = 0
+    cedulas_ok = 0
+    cedulas_sin_datos = 0
+    cedulas_error = 0
     batch_items: List[Dict[str, Any]] = []
     output_dir = Path(args.output_dir)
 
@@ -349,37 +448,63 @@ def main() -> int:
 
         for row in rows:
             dig_id = row["dig_id"]
-            cedula = row["dig_cedula"]
+            dig_tramite = row.get("dig_tramite")
             try:
-                if not re.fullmatch(r"\d{10}", cedula):
-                    raise ValueError("cedula no tiene 10 digitos")
                 fecha_iso = format_fecha_for_msp(row["dig_fecha_planilla"])
-                result = run_msp_query_with_retry(
-                    cedula,
-                    fecha_iso,
-                    retries=args.retries,
-                    retry_delay=args.retry_delay,
-                )
-                save_path = save_result(output_dir, dig_id, cedula, fecha_iso, result)
-                generated = is_coverage_generated(result)
+                targets = build_cedula_targets(row)
+                row_has_error = False
+                per_row_statuses = []
 
-                if generated and not args.dry_run:
+                for target in targets:
+                    cedula = target["cedula"]
+                    cedulas_total += 1
+                    try:
+                        result = run_msp_query_with_retry(
+                            cedula,
+                            fecha_iso,
+                            retries=args.retries,
+                            retry_delay=args.retry_delay,
+                        )
+                        generated = is_coverage_generated(result)
+                        status = "OK" if generated else "SIN_DATOS"
+                        if generated:
+                            cedulas_ok += 1
+                        else:
+                            cedulas_sin_datos += 1
+
+                        normalized = normalize_result_for_pdf(result)
+                        save_path = save_result(output_dir, dig_id, dig_tramite, cedula, fecha_iso, normalized)
+                        batch_items.append(
+                            {
+                                "dig_id": dig_id,
+                                "dig_tramite": dig_tramite,
+                                "cedula": cedula,
+                                "fecha_iso": fecha_iso,
+                                "json_path": save_path,
+                                "slot": target["slot"],
+                                "order": target["order"],
+                            }
+                        )
+                        per_row_statuses.append(f"{target['slot']}:{status}")
+                    except Exception as exc:
+                        row_has_error = True
+                        cedulas_error += 1
+                        per_row_statuses.append(f"{target['slot']}:ERROR")
+                        print(
+                            f"DIG_ID={dig_id} cedula={cedula} slot={target['slot']} fallo MSP: {exc}",
+                            file=sys.stderr,
+                        )
+
+                if not row_has_error and not args.dry_run:
                     updated = mark_done(conn, dig_id, args.pending_value, args.done_value)
                     if updated:
                         marked += 1
 
-                if generated:
-                    batch_items.append(
-                        {
-                            "dig_id": dig_id,
-                            "cedula": cedula,
-                            "fecha_iso": fecha_iso,
-                            "json_path": save_path,
-                        }
-                    )
+                if row_has_error:
+                    failures += 1
 
-                status = "GENERADA" if generated else "SIN_COBERTURA_O_ERROR"
-                print(f"DIG_ID={dig_id} cedula={cedula} fecha={fecha_iso} -> {status} json={save_path}")
+                joined_status = " | ".join(per_row_statuses)
+                print(f"DIG_ID={dig_id} fecha={fecha_iso} -> {joined_status}")
                 processed += 1
             except Exception as exc:
                 failures += 1
@@ -417,6 +542,8 @@ def main() -> int:
 
     print(
         f"Resumen: procesadas={processed} marcadas={marked} fallos={failures} "
+        f"cedulas_total={cedulas_total} cedulas_ok={cedulas_ok} "
+        f"cedulas_sin_datos={cedulas_sin_datos} cedulas_error={cedulas_error} "
         f"pdf_ok={pdf_ok} pdf_fallos={pdf_fail} dry_run={args.dry_run}"
     )
     return 0 if failures == 0 and pdf_fail == 0 else 1

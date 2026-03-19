@@ -36,6 +36,15 @@
 - Protocol mismatch: re-run the inspector and compare action ids, payload format, and response envelope.
 - Asset incompatibility in PDF generation: degrade gracefully to placeholders instead of failing the whole export.
 
+## Oracle Synchronization Decisions (Latest Hito)
+
+- Oracle sync now processes up to three cédulas per row (`DIG_CEDULA`, `DIG_DEPENDIENTE_01`, `DIG_DEPENDIENTE_02`).
+- Cédulas are validated, deduplicated, and executed in stable order: titular -> dependiente_01 -> dependiente_02.
+- Per-cédula outcomes are explicit: `OK`, `SIN_DATOS`, `ERROR`.
+- JSON persistence remains first-class and deterministic: one JSON per cédula before PDF generation.
+- PDFs are generated per cédula and merged into a single per-row artifact (`oracle_<DIG_ID>_<FECHA>_unificado.pdf`) when applicable.
+- Oracle row completion (`DIG_COBERTURA` done value) should happen only if there are no technical `ERROR` outcomes for that row.
+
 ## PDF Layout Decisions From The Latest Hito
 
 - Header and footer are drawn after body rendering using buffered pages.

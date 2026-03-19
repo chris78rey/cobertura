@@ -10,15 +10,14 @@ La conexión Oracle es **complementaria** (por ejemplo, para cruzar datos locale
 - Usar Oracle como fuente adicional, separada del core de consulta MSP.
 - Evitar mezclar lógica Oracle dentro de `scripts/query_live.js`.
 
-## 2) Forma más sencilla recomendada
+## 2) Modo de conexión recomendado
 
-La opción más simple y estable para este repo es usar **Python + `oracledb` en modo thin** (sin Instant Client).
+Para este entorno, la base Oracle actual requiere **`oracledb` en modo thick** con Oracle Instant Client.
 
-Ventajas:
+Notas:
 
-- No requiere `ojdbc` ni JVM.
-- Menos fricción en Linux/WSL.
-- Ideal para smoke tests y consultas puntuales.
+- En modo thin puede aparecer `DPY-3010` (servidor no soportado para thin).
+- Usa `--thick` y `--lib-dir` (o `ORACLE_CLIENT_LIB_DIR`) en scripts auxiliares.
 
 ## 3) Variables de entorno
 
@@ -93,10 +92,20 @@ Si imprime `1`, la conexión base está correcta.
 Se agregó `scripts/oracle_rescan_cobertura.py` para este flujo:
 
 1. leer filas de `DIGITALIZACION.DIGITALIZACION` con `DIG_COBERTURA='N'`;
-2. tomar `DIG_CEDULA` y `DIG_FECHA_PLANILLA`;
-3. ejecutar consulta MSP reutilizando `scripts/query_live.js`;
-4. guardar JSON local en `output/oracle_sync/`;
-5. actualizar `DIG_COBERTURA='S'` y `DIG_FECHA_PROCESO=SYSDATE` cuando la cobertura se genera.
+2. tomar `DIG_CEDULA`, `DIG_DEPENDIENTE_01`, `DIG_DEPENDIENTE_02` y `DIG_FECHA_PLANILLA`;
+3. validar y deduplicar cédulas (orden: titular -> dependiente_01 -> dependiente_02);
+4. ejecutar consulta MSP por cada cédula reutilizando `scripts/query_live.js`;
+5. guardar JSON local por cédula en `output/oracle_sync/`;
+6. generar PDF por cédula y unificar por registro cuando corresponda;
+7. actualizar `DIG_COBERTURA='S'` y `DIG_FECHA_PROCESO=SYSDATE` solo si el registro no tuvo errores técnicos.
+
+Estados por cédula:
+
+- `OK`: consulta y respuesta utilizable;
+- `SIN_DATOS`: consulta válida sin cobertura generada;
+- `ERROR`: fallo técnico (red/protocolo/runtime).
+
+Un `SIN_DATOS` no equivale a error técnico.
 
 Ejecución sugerida:
 

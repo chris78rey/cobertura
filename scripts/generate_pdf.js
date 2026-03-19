@@ -8,6 +8,7 @@ const { loadSvgLayout } = require("./svg_layout");
 
 const PAGE_WIDTH = 841.89;
 const PAGE_HEIGHT = 595.28;
+const REPORT_FORCE_BOLD = true;
 
 function parseArgs(argv) {
   const args = {};
@@ -122,6 +123,7 @@ function svgText({
   lineHeight = 1.2,
   fill = "#000000",
 }) {
+  const effectiveBold = bold || REPORT_FORCE_BOLD;
   const lines = width > 0 ? wrapText(text, width, size) : String(text || "").split(/\n/);
   const tspans = lines
     .map((line, index) => {
@@ -130,7 +132,7 @@ function svgText({
     })
     .join("");
   return `<text x="${x}" y="${y}" font-family="Helvetica" font-size="${size}" font-weight="${
-    bold ? "700" : "400"
+    effectiveBold ? "700" : "400"
   }" text-anchor="${anchor}" fill="${fill}">${tspans}</text>`;
 }
 
@@ -360,15 +362,17 @@ function generateSvgFromResult({ result, cedula, fecha, outputName = "", outputD
   const escudoHref =
     svgAssetHref(outDir, "escudo_ec.png") || svgAssetHref(outDir, "escudo_ec.jpg") || svgAssetHref(outDir, "escudo_ec.jpeg");
 
-  const privateRows = privados.length
-    ? privados.map((item) => [
+  const privadosConFinanciador = privados.filter((item) => String(item && item.NombreFinanciador ? item.NombreFinanciador : "").trim());
+  const showPrivateTable = privadosConFinanciador.length > 0;
+  const privateRows = showPrivateTable
+    ? privadosConFinanciador.map((item) => [
         item.RucEmpresa || "",
         item.NombreFinanciador || "",
         item.IdentificacionBeneficiario || "",
         item.NombreBeneficiario || "",
         item.ApellidosBeneficiario || "",
       ])
-    : [["NO EXISTEN RESULTADOS PARA LOS PARAMETROS INGRESADOS", "", "", "", ""]];
+    : [];
 
   const segurosRows = (seguros.length ? seguros : [{
     NombreInstitucion: "-",
@@ -392,7 +396,9 @@ function generateSvgFromResult({ result, cedula, fecha, outputName = "", outputD
   const privadosHeaderHeight = 20;
   const privadosBodyFont = 6.9;
   const privadosLineWidth = 0.55;
-  const privadosRowHeights = privateRows.map((row) => estimateRowHeight(row, privadosWidths, privadosBodyFont, 19));
+  const privadosRowHeights = showPrivateTable
+    ? privateRows.map((row) => estimateRowHeight(row, privadosWidths, privadosBodyFont, 19))
+    : [];
 
   const mainTableTop = 202;
   const mainTableBottom =
@@ -404,10 +410,12 @@ function generateSvgFromResult({ result, cedula, fecha, outputName = "", outputD
   const privateBottomLimit = fechaConsultaY - 8;
   const privateAvailableHeight = Math.max(40, privateBottomLimit - privateTableY);
 
-  const privatePages = paginateRows(privateRows, privadosRowHeights, privateAvailableHeight, privadosHeaderHeight);
+  const privatePages = showPrivateTable
+    ? paginateRows(privateRows, privadosRowHeights, privateAvailableHeight, privadosHeaderHeight)
+    : [];
 
   const pageBodies = [];
-  const firstPrivatePage = privatePages.shift() || { rows: [], rowHeights: [] };
+  const firstPrivatePage = showPrivateTable ? privatePages.shift() || { rows: [], rowHeights: [] } : { rows: [], rowHeights: [] };
   pageBodies.push(`
   ${svgText({ text: "RED PUBLICA INTEGRAL DE SALUD", x: PAGE_WIDTH / 2, y: 100, size: 13.5, bold: true, anchor: "middle" })}
   ${svgText({ text: "CONSULTA DE COBERTURA DE SALUD", x: PAGE_WIDTH / 2, y: 128, size: 10.5, bold: true, anchor: "middle" })}
@@ -432,24 +440,26 @@ function generateSvgFromResult({ result, cedula, fecha, outputName = "", outputD
   })}
 
   ${svgText({ text: "* La informacion historica reflejada corresponde a datos\ndesde Junio 2010", x: 70, y: noteY, size: 6.2, fill: "#0000ff" })}
-  ${svgText({ text: "RED PRIVADA COMPLEMENTARIA", x: 70, y: privateTitleY, size: 8, bold: true })}
-  ${svgTableDynamic({
-    x: 50,
-    y: privateTableY,
-    widths: privadosWidths,
-    headers: ["RUC", "Nombre del Financiador", "Identificacion del\nBeneficiario", "Nombres", "Apellidos"],
-    rows: firstPrivatePage.rows,
-    rowHeights: firstPrivatePage.rowHeights,
-    headerHeight: privadosHeaderHeight,
-    headerFontSize: 7.2,
-    bodyFontSize: privadosBodyFont,
-    lineWidth: privadosLineWidth,
-  })}
+  ${showPrivateTable ? svgText({ text: "RED PRIVADA COMPLEMENTARIA", x: 70, y: privateTitleY, size: 8, bold: true }) : ""}
+  ${showPrivateTable
+    ? svgTableDynamic({
+        x: 50,
+        y: privateTableY,
+        widths: privadosWidths,
+        headers: ["RUC", "Nombre del Financiador", "Identificacion del\nBeneficiario", "Nombres", "Apellidos"],
+        rows: firstPrivatePage.rows,
+        rowHeights: firstPrivatePage.rowHeights,
+        headerHeight: privadosHeaderHeight,
+        headerFontSize: 7.2,
+        bodyFontSize: privadosBodyFont,
+        lineWidth: privadosLineWidth,
+      })
+    : ""}
   ${svgText({ text: "Fecha de consulta:", x: 488, y: fechaConsultaY, size: 8.3, bold: true })}
   ${svgText({ text: formatDateTimeInTimezone(new Date(), { includeSeconds: false }), x: 690, y: fechaConsultaY, size: 8.3, anchor: "end" })}
   `);
 
-  for (const privatePage of privatePages) {
+  for (const privatePage of showPrivateTable ? privatePages : []) {
     pageBodies.push(`
     ${svgText({ text: "RED PRIVADA COMPLEMENTARIA (continuacion)", x: PAGE_WIDTH / 2, y: 120, size: 10, bold: true, anchor: "middle" })}
     ${svgTableDynamic({
