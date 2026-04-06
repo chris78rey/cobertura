@@ -70,6 +70,8 @@ function extractCookie(headers) {
   return setCookie.split(";")[0];
 }
 
+const BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
 function postText(url, headers, body) {
   return new Promise((resolve, reject) => {
     const payload = String(body);
@@ -79,6 +81,7 @@ function postText(url, headers, body) {
         method: "POST",
         headers: {
           ...headers,
+          "user-agent": BROWSER_UA,
           "content-length": Buffer.byteLength(payload),
         },
         agent: getHttpsAgent(),
