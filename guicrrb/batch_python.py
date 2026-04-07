@@ -40,28 +40,29 @@ def csconsulta(cedula):
 
 
 def aes_encrypt(text, token):
-    key = hashlib.sha256(token.encode()).digest()
-    iv = token[:16].encode() if len(token) >= 16 else token.ljust(16, "0").encode()
+    import hashlib
+    import base64
+    import os
 
-    def pkcs7_pad(data, block_size=16):
-        padding = block_size - (len(data) % block_size)
-        return data + bytes([padding] * padding)
+    def EVP_BytesToKey(password, salt, key_len, iv_len):
+        d = b""
+        d_i = b""
+        while len(d) < key_len + iv_len:
+            d_i = hashlib.md5(d_i + password + salt).digest()
+            d += d_i
+        return d[:key_len], d[key_len : key_len + iv_len]
 
-    def xor_blocks(b1, b2):
-        return bytes(a ^ b for a, b in zip(b1, b2))
+    salt = os.urandom(8)
+    key, iv = EVP_BytesToKey(token.encode(), salt, 32, 16)
 
-    padded = pkcs7_pad(text.encode())
-    blocks = [padded[i : i + 16] for i in range(0, len(padded), 16)]
+    from Crypto.Cipher import AES
 
-    result = b""
-    prev = iv
-    for block in blocks:
-        xored = xor_blocks(block, prev)
-        encrypted = bytes(a ^ b for a, b in zip(xored, key[:16]))
-        prev = encrypted
-        result += encrypted
+    cipher = AES.new(key, AES.MODE_CBC, iv)
+    pad_len = 16 - len(text) % 16
+    padded = text.encode() + bytes([pad_len] * pad_len)
+    encrypted = cipher.encrypt(padded)
 
-    return base64.b64encode(result).decode()
+    return base64.b64encode(b"Salted__" + salt + encrypted).decode()
 
 
 def parse_rsc_payload(text):
