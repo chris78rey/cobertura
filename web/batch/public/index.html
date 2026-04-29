@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cobertura MSP - Batch Generator</title>
+    <style>
+        * { box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }
+        .container { max-width: 900px; margin: 0 auto; }
+        h1 { color: #333; }
+        .card { background: white; border-radius: 8px; padding: 20px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .form-group { margin-bottom: 15px; }
+        label { display: block; margin-bottom: 5px; font-weight: 600; color: #555; }
+        input, select { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; }
+        .row { display: flex; gap: 15px; }
+        .row > * { flex: 1; }
+        button { padding: 12px 24px; border: none; border-radius: 4px; font-size: 16px; cursor: pointer; }
+        button.primary { background: #2563eb; color: white; }
+        button.primary:hover { background: #1d4ed8; }
+        button.primary:disabled { background: #93c5fd; cursor: not-allowed; }
+        button.danger { background: #dc2626; color: white; }
+        .log { background: #1e1e1e; color: #d4d4d4; padding: 15px; border-radius: 4px; height: 300px; overflow-y: auto; font-family: 'Consolas', monospace; font-size: 13px; }
+        .log-entry { margin: 2px 0; }
+        .log-entry.error { color: #f87171; }
+        .log-entry.success { color: #4ade80; }
+        .progress { height: 20px; background: #e5e7eb; border-radius: 10px; overflow: hidden; margin-bottom: 20px; }
+        .progress-bar { height: 100%; background: #2563eb; transition: width 0.3s; width: 0%; }
+        .stats { display: flex; gap: 20px; margin-bottom: 15px; }
+        .stat { padding: 10px 20px; background: #f3f4f6; border-radius: 4px; }
+        .stat-value { font-size: 24px; font-weight: bold; color: #2563eb; }
+        .stat-label { font-size: 12px; color: #666; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>📄 Cobertura MSP - Batch Generator</h1>
+        
+        <div class="card">
+            <h2>Configuración</h2>
+            <div class="row">
+                <div class="form-group">
+                    <label>Desde:</label>
+                    <input type="date" id="start_date">
+                </div>
+                <div class="form-group">
+                    <label>Hasta:</label>
+                    <input type="date" id="end_date">
+                </div>
+                <div class="form-group">
+                    <label>Modo:</label>
+                    <select id="modo">
+                        <option value="DIG_COBERTURA">Solo pendientes (DIG_COBERTURA=N)</option>
+                        <option value="TODOS">Todos (max 100)</option>
+                    </select>
+                </div>
+            </div>
+            <div class="form-group">
+                <label>Directorio de salida:</label>
+                <input type="text" id="output_dir" value="/home/crrb/codex_projects/cobertura/output">
+            </div>
+            <div style="display: flex; gap: 10px;">
+                <button class="primary" id="btn_query">Consultar Registros</button>
+                <button class="primary" id="btn_start" disabled>▶ Iniciar Proceso</button>
+                <button class="danger" id="btn_stop" disabled>■ Detener</button>
+            </div>
+        </div>
+        
+        <div class="card">
+            <div class="stats">
+                <div class="stat">
+                    <div class="stat-value" id="total_records">0</div>
+                    <div class="stat-label">Registros encontrados</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-value" id="processed">0</div>
+                    <div class="stat-label">Procesados</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-value" id="status">-</div>
+                    <div class="stat-label">Estado</div>
+                </div>
+            </div>
+            <div class="progress">
+                <div class="progress-bar" id="progress_bar"></div>
+            </div>
+            <div class="log" id="log"></div>
+        </div>
+    </div>
+    
+    <script>
+        const startDate = document.getElementById('start_date');
+        const endDate = document.getElementById('end_date');
+        const modo = document.getElementById('modo');
+        const outputDir = document.getElementById('output_dir');
+        const btnQuery = document.getElementById('btn_query');
+        const btnStart = document.getElementById('btn_start');
+        const btnStop = document.getElementById('btn_stop');
+        const log = document.getElementById('log');
+        const progressBar = document.getElementById('progress_bar');
+        const totalRecords = document.getElementById('total_records');
+        const processed = document.getElementById('processed');
+        const statusEl = document.getElementById('status');
+        
+        let total = 0;
+        let processedCount = 0;
+        let running = false;
+        let eventSource = null;
+        
+        const today = new Date();
+        const oneMonthAgo = new Date(today.getFullYear(), today.getMonth() - 1, today.getDate());
+        
+        startDate.value = oneMonthAgo.toISOString().split('T')[0];
+        endDate.value = today.toISOString().split('T')[0];
+        
+        function logMessage(msg, type = '') {
+            const entry = document.createElement('div');
+            entry.className = 'log-entry' + (type ? ' ' + type : '');
+            entry.textContent = new Date().toLocaleTimeString() + ' ' + msg;
+            log.appendChild(entry);
+            log.scrollTop = log.scrollHeight;
+        }
+        
+        btnQuery.addEventListener('click', async () => {
+            btnQuery.disabled = true;
+            logMessage('Consultando Oracle...');
+            
+            try {
+                const res = await fetch('/api/query-records', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        start_date: startDate.value,
+                        end_date: endDate.value,
+                        modo: modo.value
+                    })
+                });
+                const data = await res.json();
+                
+                if (data.success) {
+                    total = data.records.length;
+                    totalRecords.textContent = total;
+                    processedCount = 0;
+                    processed.textContent = '0';
+                    logMessage(`Encontrados ${total} registros`, total > 0 ? 'success' : '');
+                    btnStart.disabled = total === 0;
+                    statusEl.textContent = 'Listo';
+                } else {
+                    logMessage('Error: ' + data.error, 'error');
+                    btnStart.disabled = true;
+                }
+            } catch (e) {
+                logMessage('Error: ' + e.message, 'error');
+            }
+            
+            btnQuery.disabled = false;
+        });
+        
+        btnStart.addEventListener('click', async () => {
+            if (running) return;
+            
+            running = true;
+            processedCount = 0;
+            btnStart.disabled = true;
+            btnStop.disabled = false;
+            btnQuery.disabled = true;
+            statusEl.textContent = 'Corriendo';
+            logMessage('Iniciando proceso...');
+            
+            eventSource = new EventSource('/api/stream');
+            
+            eventSource.onmessage = (e) => {
+                try {
+                    const data = JSON.parse(e.data);
+                    
+                    if (data.type === 'log') {
+                        logMessage(data.message);
+                        if (data.message.includes('OK') || data.message.includes('Exitosos')) {
+                            processedCount++;
+                            processed.textContent = processedCount;
+                            if (total > 0) {
+                                progressBar.style.width = ((processedCount / total) * 100) + '%';
+                            }
+                        }
+                    } else if (data.type === 'error') {
+                        logMessage(data.message, 'error');
+                    } else if (data.type === 'done') {
+                        logMessage('Proceso finalizado con código: ' + data.code);
+                        progressBar.style.width = '100%';
+                        statusEl.textContent = 'Finalizado';
+                        stopProcess();
+                    }
+                } catch (e) {}
+            };
+            
+            try {
+                await fetch('/api/process-batch', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        start_date: startDate.value,
+                        end_date: endDate.value,
+                        modo: modo.value,
+                        output_dir: outputDir.value
+                    })
+                });
+            } catch (e) {
+                logMessage('Error: ' + e.message, 'error');
+                stopProcess();
+            }
+        });
+        
+        function stopProcess() {
+            running = false;
+            btnStart.disabled = false;
+            btnStop.disabled = true;
+            btnQuery.disabled = false;
+            if (eventSource) {
+                eventSource.close();
+                eventSource = null;
+            }
+        }
+        
+        btnStop.addEventListener('click', () => {
+            logMessage('Deteniendo...');
+            stopProcess();
+            statusEl.textContent = 'Detenido';
+        });
+    </script>
+</body>
+</html>

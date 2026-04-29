@@ -40,29 +40,23 @@ def csconsulta(cedula):
 
 
 def aes_encrypt(text, token):
-    import hashlib
-    import base64
-    import os
+    import subprocess
+    import json
 
-    def EVP_BytesToKey(password, salt, key_len, iv_len):
-        d = b""
-        d_i = b""
-        while len(d) < key_len + iv_len:
-            d_i = hashlib.md5(d_i + password + salt).digest()
-            d += d_i
-        return d[:key_len], d[key_len : key_len + iv_len]
+    script = f"""
+    const CryptoJS = require('crypto-js');
+    const token = {json.dumps(token)};
+    const text = {json.dumps(text)};
+    console.log(CryptoJS.AES.encrypt(text, token).toString());
+    """
 
-    salt = os.urandom(8)
-    key, iv = EVP_BytesToKey(token.encode(), salt, 32, 16)
-
-    from Crypto.Cipher import AES
-
-    cipher = AES.new(key, AES.MODE_CBC, iv)
-    pad_len = 16 - len(text) % 16
-    padded = text.encode() + bytes([pad_len] * pad_len)
-    encrypted = cipher.encrypt(padded)
-
-    return base64.b64encode(b"Salted__" + salt + encrypted).decode()
+    result = subprocess.run(
+        ["node", "-e", script],
+        capture_output=True,
+        text=True,
+        cwd="/home/crrb/codex_projects/cobertura",
+    )
+    return result.stdout.strip()
 
 
 def parse_rsc_payload(text):
@@ -73,12 +67,13 @@ def parse_rsc_payload(text):
 
 
 def post_action(action_id, params, cookie=None):
-    data = json.dumps(params)
+    data = json.dumps(params, separators=(",", ":"))
     headers = {
         "Content-Type": "text/plain;charset=UTF-8",
         "User-Agent": USER_AGENT,
         "next-action": action_id,
         "Accept": "*/*",
+        "Content-Length": str(len(data)),
     }
     if cookie:
         headers["Cookie"] = cookie
@@ -89,7 +84,9 @@ def post_action(action_id, params, cookie=None):
 
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
-            set_cookie = resp.getheader("Set-Cookie", "")
+            set_cookie = resp.getheader("Set-Cookie", "") or ""
+            if set_cookie:
+                set_cookie = set_cookie.split(";")[0]
             body = resp.read().decode()
             return set_cookie, body
     except urllib.error.HTTPError as e:
@@ -121,6 +118,8 @@ def query_msp(cedula, fecha):
             encrypted_id = aes_encrypt(cedula, token)
             encrypted_date = aes_encrypt(fecha, token)
             cs = csconsulta(cedula)
+
+            time.sleep(0.5)
 
             cookie2, resp2 = post_action(
                 ACTION_API_CLIENT,

@@ -1,9 +1,6 @@
 import sys
 import os
-import random
-import time
 import subprocess
-import glob
 from datetime import datetime
 from PyQt6.QtWidgets import (
     QApplication,
@@ -25,7 +22,6 @@ from PyQt6.QtWidgets import (
     QCheckBox,
 )
 from PyQt6.QtCore import QThread, pyqtSignal, QDate
-from pypdf import PdfWriter
 
 sys.path.insert(0, os.path.dirname(__file__))
 import oracledb
@@ -47,32 +43,18 @@ class Worker(QThread):
     finished = pyqtSignal()
     status = pyqtSignal(str)
 
-    def __init__(self, start_date, end_date, modo, output_dir, skip_update=False):
+    def __init__(self, start_date, end_date, modo, output_dir, limit=100):
         super().__init__()
         self.start_date = start_date
         self.end_date = end_date
         self.modo = modo
         self.output_dir = output_dir
-        self.skip_update = skip_update
-
-    def merge_pdfs(self, pdf_paths, output_path):
-        merger = PdfWriter()
-        for pdf in pdf_paths:
-            try:
-                merger.append(pdf)
-            except Exception as e:
-                self.log.emit(f"  Error merge {pdf}: {e}")
-        with open(output_path, "wb") as f:
-            merger.write(f)
-        for pdf in pdf_paths:
-            try:
-                os.remove(pdf)
-            except:
-                pass
+        self.limit = limit
 
     def run(self):
         try:
-            self.status.emit("Conectando a Oracle...")
+            self.status.emit("Consultando Oracle...")
+
             oracledb.init_oracle_client(lib_dir=ORACLE_CONFIG["lib_dir"])
             conn = oracledb.connect(
                 user=ORACLE_CONFIG["user"],
@@ -89,6 +71,7 @@ class Worker(QThread):
                     FROM DIGITALIZACION
                     WHERE DIG_COBERTURA = 'N'
                     AND DIG_FECHA_HASTA BETWEEN TO_DATE(:sd, 'YYYY-MM-DD') AND TO_DATE(:ed, 'YYYY-MM-DD')
+                    AND ROWNUM <= :limit
                 """
             else:
                 query = """
@@ -97,19 +80,20 @@ class Worker(QThread):
                            TO_CHAR(DIG_FECHA_HASTA, 'YYYY-MM-DD')
                     FROM DIGITALIZACION
                     WHERE DIG_FECHA_HASTA BETWEEN TO_DATE(:sd, 'YYYY-MM-DD') AND TO_DATE(:ed, 'YYYY-MM-DD')
-                    AND ROWNUM <= 100
+                    AND ROWNUM <= :limit
                 """
 
-            self.status.emit("Consultando registros...")
-            cursor.execute(query, sd=self.start_date, ed=self.end_date)
+            cursor.execute(
+                query, sd=self.start_date, ed=self.end_date, limit=self.limit
+            )
             records = cursor.fetchall()
+            conn.close()
 
             total = len(records)
-            self.log.emit(f"Registros encontrados: {total}")
+            self.log.emit(f"Registros a procesar: {total}")
 
             if total == 0:
                 self.log.emit("No hay registros para procesar.")
-                conn.close()
                 self.status.emit("Sin registros")
                 self.finished.emit()
                 return
@@ -139,47 +123,52 @@ class Worker(QThread):
                         cmd, capture_output=True, text=True, cwd=REPO_DIR
                     )
                     if result.returncode == 0:
-                        self.log.emit(f"  ✓ {cedula}: OK")
-                        pdf_pattern = os.path.join(
-                            self.output_dir, f"cobertura_{cedula}_{fecha}.pdf"
+                        self.log.emit(f"  OK: {cedula}")
+                        pdf_paths.append(
+                            os.path.join(
+                                self.output_dir, f"cobertura_{cedula}_{fecha}.pdf"
+                            )
                         )
-                        matched = glob.glob(pdf_pattern)
-                        if matched:
-                            pdf_paths.extend(matched)
                         ok_count += 1
                     else:
-                        self.log.emit(f"  ✗ {cedula}: {result.stderr.strip()[:60]}")
+                        self.log.emit(f"  ERROR: {cedula}")
                         fail_count += 1
 
                 if len(pdf_paths) > 1:
+                    from pypdf import PdfWriter
+
                     merged_name = f"{tramite}_CC.pdf"
                     merged_path = os.path.join(self.output_dir, merged_name)
-                    self.merge_pdfs(pdf_paths, merged_path)
-                    self.log.emit(f"  >> Merged: {merged_name}")
+                    merger = PdfWriter()
+                    for pdf in pdf_paths:
+                        if os.path.exists(pdf):
+                            try:
+                                merger.append(pdf)
+                            except:
+                                pass
+                    with open(merged_path, "wb") as f:
+                        merger.write(f)
+                    for pdf in pdf_paths:
+                        try:
+                            os.remove(pdf)
+                        except:
+                            pass
+                    self.log.emit(f"  Merge: {merged_name}")
                 elif len(pdf_paths) == 1:
                     final_name = f"{tramite}_CC.pdf"
                     final_path = os.path.join(self.output_dir, final_name)
-                    os.rename(pdf_paths[0], final_path)
-                    self.log.emit(f"  >> Renamed: {final_name}")
-
-                if self.modo == "DIG_COBERTURA" and not self.skip_update:
-                    cursor.execute(
-                        "UPDATE DIGITALIZACION SET DIG_COBERTURA = 'S' WHERE DIG_ID = :id",
-                        id=dig_id,
-                    )
-                    conn.commit()
-
-                wait_time = random.uniform(3, 7)
-                self.log.emit(f"  Esperando {wait_time:.1f}s...")
-                time.sleep(wait_time)
+                    try:
+                        os.rename(pdf_paths[0], final_path)
+                    except:
+                        pass
+                    self.log.emit(f"  Rename: {final_name}")
 
                 self.progress.emit(int(((i + 1) / total) * 100))
 
-            conn.close()
             self.log.emit(f"\n--- FINALIZADO ---")
-            self.log.emit(f"Exitosos: {ok_count}")
-            self.log.emit(f"Fallidos: {fail_count}")
-            self.status.emit(f"Completado: {ok_count} OK, {fail_count} fallidos")
+            self.log.emit(f"Procesados: {ok_count + fail_count}")
+            self.log.emit(f"OK: {ok_count}, Errores: {fail_count}")
+            self.status.emit(f"Completado: {ok_count} OK")
         except Exception as e:
             self.log.emit(f"ERROR: {str(e)}")
             self.status.emit("Error de conexion")
@@ -227,10 +216,8 @@ class MainWindow(QMainWindow):
         modo_layout.addWidget(QLabel("Modo:"))
         self.modo = QComboBox()
         self.modo.addItem("Solo pendientes (DIG_COBERTURA=N)", "DIG_COBERTURA")
-        self.modo.addItem("Todos (max 100 registros)", "TODOS")
+        self.modo.addItem("Prueba (max 100)", "TODOS")
         modo_layout.addWidget(self.modo)
-        self.skip_update = QCheckBox("No marcar procesados")
-        modo_layout.addWidget(self.skip_update)
         modo_layout.addStretch()
         config_layout.addLayout(modo_layout)
 
@@ -277,14 +264,13 @@ class MainWindow(QMainWindow):
         ed = self.date_end.date().toString("yyyy-MM-dd")
         modo = self.modo.currentData()
         output = self.output_dir.text()
-        skip = self.skip_update.isChecked()
 
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
         self.progress_bar.setValue(0)
         self.log_view.clear()
 
-        self.worker = Worker(sd, ed, modo, output, skip)
+        self.worker = Worker(sd, ed, modo, output)
         self.worker.progress.connect(self.progress_bar.setValue)
         self.worker.log.connect(self.log_view.append)
         self.worker.status.connect(self.status_bar.showMessage)

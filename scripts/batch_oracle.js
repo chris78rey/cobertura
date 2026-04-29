@@ -17,14 +17,43 @@ async function getOracleConnection() {
   });
 }
 
-async function queryRecords(conn, limit = 50) {
-  const result = await conn.execute(`
-    SELECT dig_cedula, TO_CHAR(dig_fecha_hasta, 'YYYY-MM-DD') as dig_fecha_hasta 
-    FROM DIGITALIZACION 
-    WHERE dig_fecha_hasta >= TO_DATE('2026-04-01', 'YYYY-MM-DD')
-    AND ROWNUM <= :limit
-  `, [limit]);
+async function queryRecords(conn, startDate, endDate, modo, limit = 50) {
+  let query, params;
+  
+  if (modo === 'DIG_COBERTURA') {
+    query = `
+      SELECT DIG_ID, DIG_TRAMITE, DIG_CEDULA, DIG_MENOR_EDAD,
+             DIG_DEPENDIENTE_01, DIG_DEPENDIENTE_02,
+             TO_CHAR(DIG_FECHA_HASTA, 'YYYY-MM-DD')
+      FROM DIGITALIZACION 
+      WHERE DIG_COBERTURA = 'N'
+      AND DIG_FECHA_HASTA BETWEEN TO_DATE(:startDate, 'YYYY-MM-DD') AND TO_DATE(:endDate, 'YYYY-MM-DD')
+      AND ROWNUM <= :limit
+    `;
+    params = { startDate, endDate, limit };
+  } else {
+    query = `
+      SELECT DIG_ID, DIG_TRAMITE, DIG_CEDULA, DIG_MENOR_EDAD,
+             DIG_DEPENDIENTE_01, DIG_DEPENDIENTE_02,
+             TO_CHAR(DIG_FECHA_HASTA, 'YYYY-MM-DD')
+      FROM DIGITALIZACION 
+      WHERE DIG_FECHA_HASTA BETWEEN TO_DATE(:startDate, 'YYYY-MM-DD') AND TO_DATE(:endDate, 'YYYY-MM-DD')
+      AND ROWNUM <= :limit
+    `;
+    params = { startDate, endDate, limit };
+  }
+  
+  const result = await conn.execute(query, params);
   return result.rows;
+}
+
+async function markAsProcessed(conn, digId) {
+  await conn.execute(
+    `UPDATE DIGITALIZACION SET DIG_COBERTURA = 'S' WHERE DIG_ID = :digId`,
+    { digId },
+    { autoCommit: false }
+  );
+  await conn.commit();
 }
 
 async function queryWithRetry(cedula, fecha, retries = MAX_RETRIES) {
@@ -48,6 +77,9 @@ async function main() {
   const cedulaArg = args.find(a => a.startsWith('--cedula='))?.split('=')[1];
   const fechaArg = args.find(a => a.startsWith('--fecha='))?.split('=')[1];
   const limitArg = args.find(a => a.startsWith('--limit='))?.split('=')[1];
+  const startDateArg = args.find(a => a.startsWith('--start-date='))?.split('=')[1];
+  const endDateArg = args.find(a => a.startsWith('--end-date='))?.split('=')[1];
+  const modoArg = args.find(a => a.startsWith('--modo='))?.split('=')[1] || 'DIG_COBERTURA';
   const outputDir = args.find(a => a.startsWith('--output-dir='))?.split('=')[1] || process.env.COBERTURA_OUTPUT_DIR || 'output';
 
   if (cedulaArg && fechaArg) {
@@ -70,23 +102,27 @@ async function main() {
   }
 
   const limit = parseInt(limitArg || '50');
-  console.log(`Batch Oracle → Portal MSP (limit=${limit}, delay=${DELAY_MS}ms, output=${outputDir})\n`);
+  const startDate = startDateArg || '2026-04-01';
+  const endDate = endDateArg || '2026-04-01';
+  
+  console.log(`Batch Oracle → Portal MSP (limit=${limit}, start=${startDate}, end=${endDate}, modo=${modoArg}, output=${outputDir})\n`);
 
   let conn;
   try {
     conn = await getOracleConnection();
-    const records = await queryRecords(conn, limit);
+    const records = await queryRecords(conn, startDate, endDate, modoArg, limit);
     console.log(`Registros a procesar: ${records.length}\n`);
 
     let success = 0, fail = 0;
     for (let i = 0; i < records.length; i++) {
-      const [cedula, fecha] = records[i];
-      process.stdout.write(`[${i+1}/${records.length}] ${cedula}... `);
+      const [dig_id, tramite, cedula, es_menor, d1, d2, fecha] = records[i];
+      process.stdout.write(`[${i+1}/${records.length}] ${tramite} (${cedula})... `);
       
       try {
         const result = await queryWithRetry(cedula, fecha);
         if (result?.response?.success === 'success') {
           await generatePdfFromResult({ result, cedula, fecha, outputDir });
+          await markAsProcessed(conn, dig_id);
           success++;
           console.log('OK');
         } else {
